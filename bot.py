@@ -9,7 +9,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler
 
 # ========== 配置 ==========
-TOKEN = "8179579064:AAHPZAhthw4i_YFFe3UerGrNmoJc2wWKd5g"  # 请替换为实际Token
+TOKEN = "8686804795:AAFe6KzzbHABTz8o7UwzyquU4DWMWqBamHg"  # 请替换为实际Token
 ALLOWED_GROUPS = [-1003002241602, -1003745425265, -1003720878201]   # 仅允许这两个群组
 ADMIN_IDS = [8354445328, 877039616]
 
@@ -269,12 +269,10 @@ async def cb(update, ctx):
                 f"✅ {n} 兑换成功！消耗 {p} 学分",
                 reply_markup=Markup([[Btn("🔙 返回钱包", callback_data="back")]])
             )
-            # 群组中公开通知
+            # 群组中公开通知（不带@管理员）
             if update.effective_chat.type in ('group', 'supergroup'):
                 try:
-                    admin_mentions = [f'<a href="tg://user?id={aid}">管理员</a>' for aid in ADMIN_IDS]
-                    mention_text = " ".join(admin_mentions) if admin_mentions else ""
-                    msg = f"🎉 {name} 成功兑换了 {n}！消耗 {p} 学分。{mention_text}"
+                    msg = f"🎉 {name} 成功兑换了 {n}！消耗 {p} 学分。"
                     await ctx.bot.send_message(
                         chat_id=update.effective_chat.id,
                         text=msg,
@@ -282,6 +280,16 @@ async def cb(update, ctx):
                     )
                 except Exception as e:
                     print(f"群组通知发送失败: {e}")
+            # 私聊通知每位管理员
+            for aid in ADMIN_IDS:
+                try:
+                    admin_msg = f"用户 {name}（ID: {uid}）兑换了 {n}，消耗 {p} 学分。"
+                    await ctx.bot.send_message(
+                        chat_id=aid,
+                        text=admin_msg
+                    )
+                except Exception as e:
+                    print(f"私聊管理员 {aid} 失败: {e}")
             # 私聊购买记录
             try:
                 await ctx.bot.send_message(
