@@ -9,7 +9,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler
 
 # ========== 配置 ==========
-TOKEN = "8686804795:AAFe6KzzbHABTz8o7UwzyquU4DWMWqBamHg"  # 请替换为实际Token
+TOKEN = "8179579064:AAF57RUAH5TVtrW4qdA4_wIAtWkRAAkqkvo"  # 请替换为实际Token
 ALLOWED_GROUPS = [-1003002241602, -1003745425265, -1003720878201]   # 仅允许这两个群组
 ADMIN_IDS = [8354445328, 877039616]
 
