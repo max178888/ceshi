@@ -157,12 +157,13 @@ def check_and_use_first_bonus(uid):
         conn.commit()
         return True
 
+# ---------- 限量商品通用函数 ----------
 def get_remaining(item_id):
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("SELECT remaining FROM global_limits WHERE item_id=?", (item_id,))
         row = c.fetchone()
-        return row[0] if row else 0
+        return row[0] if row else None   # None 表示无限量
 
 def decrease_remaining(item_id):
     with db_connect() as conn:
@@ -181,18 +182,13 @@ def wallet_kb():
 def shop_kb():
     keyboard = []
     for i, n, p in SHOP:
-        with db_connect() as conn:
-            c = conn.cursor()
-            c.execute("SELECT remaining FROM global_limits WHERE item_id=?", (i,))
-            row = c.fetchone()
-        if row:
-            rem = row[0]
-            if rem > 0:
-                text = f"{n} 剩余{rem} - {p}💎"
-            else:
-                text = f"{n} 已售罄 - {p}💎"
-        else:
+        rem = get_remaining(i)
+        if rem is None:
             text = f"{n} - {p}💎"
+        elif rem > 0:
+            text = f"{n} 剩余{rem} - {p}💎"
+        else:
+            text = f"{n} 已售罄 - {p}💎"
         keyboard.append([Btn(text, callback_data=f"buy_{i}")])
     return Markup(keyboard)
 
@@ -244,14 +240,14 @@ async def cb(update, ctx):
         _, n, p = item
         current = get_coins(uid)
 
-        if iid == 3:
-            remaining = get_remaining(3)
-            if remaining <= 0:
-                await query.edit_message_text(
-                    "❌ 商品已换完，下次早点来哦！",
-                    reply_markup=Markup([[Btn("🔙 返回钱包", callback_data="back")]])
-                )
-                return
+        # 统一限量检查
+        remaining = get_remaining(iid)
+        if remaining is not None and remaining <= 0:
+            await query.edit_message_text(
+                "❌ 商品已换完，下次早点来哦！",
+                reply_markup=Markup([[Btn("🔙 返回钱包", callback_data="back")]])
+            )
+            return
 
         if current < p:
             await query.edit_message_text(
@@ -261,15 +257,14 @@ async def cb(update, ctx):
             return
 
         if sub_coins(uid, p, f"购买 {n}"):
-            if iid == 3:
-                decrease_remaining(3)
+            if remaining is not None:
+                decrease_remaining(iid)
             new_balance = get_coins(uid)
-            # 编辑原消息
             await query.edit_message_text(
                 f"✅ {n} 兑换成功！消耗 {p} 学分",
                 reply_markup=Markup([[Btn("🔙 返回钱包", callback_data="back")]])
             )
-            # 群组中公开通知（不带@管理员）
+            # 群组公开通知（不带@管理员）
             if update.effective_chat.type in ('group', 'supergroup'):
                 try:
                     msg = f"🎉 {name} 成功兑换了 {n}！消耗 {p} 学分。"
@@ -394,19 +389,11 @@ async def admin_list_items(update, ctx):
         return
     text = "📦 商品列表：\n"
     for gid, name, price in SHOP:
-        if gid == 3:
-            rem = get_remaining(3)
-            text += f"ID:{gid} {name} - {price}💎 (剩余{rem}/1)\n"
+        rem = get_remaining(gid)
+        if rem is None:
+            text += f"ID:{gid} {name} - {price}💎 (无限量)\n"
         else:
-            with db_connect() as conn:
-                c = conn.cursor()
-                c.execute("SELECT remaining FROM global_limits WHERE item_id=?", (gid,))
-                row = c.fetchone()
-            if row:
-                rem = row[0]
-                text += f"ID:{gid} {name} - {price}💎 (剩余{rem})\n"
-            else:
-                text += f"ID:{gid} {name} - {price}💎\n"
+            text += f"ID:{gid} {name} - {price}💎 (剩余{rem})\n"
     await update.message.reply_text(text)
 
 async def admin_del_item(update, ctx):
@@ -743,7 +730,6 @@ async def settle_round(context, rid, chat_id):
                 win = amount * 3
         if win > 0:
             win_after_rake = win * (1 - RAKE)
-            # 返还本金 + 净收益
             add_coins(uid, amount + win_after_rake, f"骰子中奖 {bet_type}")
             winners.append((uid, amount, bet_type, win_after_rake))
             update_bet_win(rid, uid, win_after_rake)
