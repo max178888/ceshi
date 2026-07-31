@@ -425,25 +425,46 @@ async def admin_del_item(update, ctx):
 # ========== 抽奖功能（新增） ==========
 # ---- 管理员私聊命令 ----
 async def create_lottery(update, ctx):
-    """创建抽奖：/create_lottery <奖品描述> <消耗学分> <开奖时间 YYYY-MM-DD HH:MM>"""
+    """创建抽奖：/create_lottery <奖品描述> <消耗学分> <开奖时间>"""
     if update.effective_chat.type != 'private':
         return
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
         return
-    args = ctx.args
-    if len(args) != 3:
-        await update.message.reply_text("用法：/create_lottery <奖品描述> <消耗学分> <开奖时间>\n例如：/create_lottery iPhone15 50 2026-08-01 20:00")
+
+    # 直接解析消息文本，避免 ctx.args 分割问题
+    text = update.message.text.strip()
+    # 去除命令前缀
+    if text.startswith('/create_lottery'):
+        parts = text[len('/create_lottery'):].strip().split(' ')
+    else:
+        parts = text.split(' ')[1:]  # 回退方案
+
+    # 过滤空字符串
+    parts = [p for p in parts if p.strip()]
+
+    if len(parts) < 3:
+        await update.message.reply_text(
+            "用法：/create_lottery <奖品描述> <消耗学分> <开奖时间>\n"
+            "例如：/create_lottery iPhone15 50 2026-08-01 20:00\n"
+            "注意：奖品描述如果有空格，请用引号括起来，例如 \"iPhone 15 Pro\""
+        )
         return
-    prize = args[0]
+
+    # 处理奖品描述（可能有空格）
     try:
-        cost = float(args[1])
-        if cost <= 0:
-            raise ValueError
-        draw_time = datetime.strptime(args[2], "%Y-%m-%d %H:%M")
+        # 尝试解析时间（最后一部分）
+        draw_time_str = parts[-1]
+        draw_time = datetime.strptime(draw_time_str, "%Y-%m-%d %H:%M")
         if draw_time <= datetime.now():
             await update.message.reply_text("开奖时间必须在未来。")
             return
+        # 尝试解析学分（倒数第二部分）
+        cost = float(parts[-2])
+        if cost <= 0:
+            raise ValueError
+        # 奖品描述是剩余所有部分拼接
+        prize = ' '.join(parts[:-2])
     except ValueError:
         await update.message.reply_text("消耗学分必须是正数，时间格式为 YYYY-MM-DD HH:MM")
         return
@@ -454,7 +475,13 @@ async def create_lottery(update, ctx):
                   (prize, cost, draw_time, update.effective_user.id))
         lid = c.lastrowid
         conn.commit()
-    await update.message.reply_text(f"✅ 抽奖已创建！ID: {lid}\n奖品：{prize}\n消耗：{cost} 学分\n开奖时间：{draw_time.strftime('%Y-%m-%d %H:%M')}")
+
+    await update.message.reply_text(
+        f"✅ 抽奖已创建！ID: {lid}\n"
+        f"奖品：{prize}\n"
+        f"消耗：{cost} 学分\n"
+        f"开奖时间：{draw_time.strftime('%Y-%m-%d %H:%M')}"
+    )
 
 async def list_lotteries(update, ctx):
     """列出所有抽奖：/list_lotteries"""
@@ -519,7 +546,6 @@ async def end_lottery(update, ctx):
         participants = [r[0] for r in c.fetchall()]
         if not participants:
             await update.message.reply_text("该抽奖暂无参与者，无法开奖。")
-            # 可考虑直接标记结束
             c.execute("UPDATE lotteries SET status=1 WHERE id=?", (lid,))
             conn.commit()
             return
@@ -970,7 +996,7 @@ def main():
     app.add_handler(CommandHandler("create_lottery", create_lottery))
     app.add_handler(CommandHandler("list_lotteries", list_lotteries))
     app.add_handler(CommandHandler("end_lottery", end_lottery))
-    app.add_handler(MessageHandler(filters.Regex(r'^抽奖$'), lottery_participate))  # 优先匹配，放在on_msg之前
+    app.add_handler(MessageHandler(filters.Regex(r'^抽奖$'), lottery_participate))  # 优先匹配
     app.run_polling(allowed_updates=["message", "callback_query"])
 
 if __name__ == "__main__":
