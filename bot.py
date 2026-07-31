@@ -15,7 +15,7 @@ def now_cn():
     return datetime.now(CHINA_TZ).replace(tzinfo=None)
 
 # ========== 配置 ==========
-TOKEN = "8179579064:AAF57RUAH5TVtrW4qdA4_wIAtWkRAAkqkvo"
+TOKEN = "8179579064:AAF57RUAH5TVtrW4qdA4_wIAtWkRAAkqkvo"   # 请替换为你的Token
 ALLOWED_GROUPS = [-1003002241602, -1003745425265, -1003720878201]
 ADMIN_IDS = [8354445328, 877039616, 42438298]
 
@@ -486,7 +486,6 @@ async def admin_del_item(update, ctx):
 
 # ========== 抽奖管理员命令 ==========
 async def cmd_create_lottery(update, ctx):
-    """创建抽奖：/cj 标题 奖品 消耗学分 开奖时间"""
     if update.effective_chat.type != 'private':
         return
     if update.effective_user.id not in ADMIN_IDS:
@@ -510,9 +509,12 @@ async def cmd_create_lottery(update, ctx):
     draw_time_str = match.group(1)
     try:
         dt = datetime.strptime(draw_time_str, "%Y-%m-%d %H:%M")
-        if dt <= now_cn():
-            await update.message.reply_text(f"开奖时间必须在未来。当前时间：{now_cn().strftime('%Y-%m-%d %H:%M')}")
+        now = now_cn()
+        if dt <= now:
+            await update.message.reply_text(f"开奖时间必须在未来。当前时间：{now.strftime('%Y-%m-%d %H:%M')}")
             return
+        if (dt - now).total_seconds() < 60:
+            await update.message.reply_text(f"⚠️ 开奖时间与当前时间相差小于1分钟，可能因网络延迟导致立即开奖，建议设置至少1分钟后的时间。")
         draw_time = dt
     except ValueError:
         await update.message.reply_text("时间格式无效，请使用 YYYY-MM-DD HH:MM")
@@ -582,7 +584,6 @@ async def cmd_list_lotteries(update, ctx):
     await update.message.reply_text(text)
 
 async def cmd_force_end_lottery(update, ctx):
-    """手动开奖：/qx <抽奖ID>"""
     if update.effective_chat.type != 'private':
         return
     if update.effective_user.id not in ADMIN_IDS:
@@ -603,7 +604,6 @@ async def cmd_force_end_lottery(update, ctx):
 
 # ========== 抽奖核心开奖函数 ==========
 async def do_draw(lottery_id, bot):
-    """执行开奖，发送结果到所有允许的群组，返回 (是否成功, 消息)"""
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("SELECT id, title, prize, cost, status, draw_time FROM lotteries WHERE id=?", (lottery_id,))
@@ -639,9 +639,10 @@ async def auto_draw_loop(bot):
     while True:
         try:
             now = now_cn()
+            threshold = now - timedelta(minutes=1)   # 1分钟缓冲
             with db_connect() as conn:
                 c = conn.cursor()
-                c.execute("SELECT id FROM lotteries WHERE status=0 AND draw_time <= ?", (now.isoformat(),))
+                c.execute("SELECT id FROM lotteries WHERE status=0 AND draw_time <= ?", (threshold.isoformat(),))
                 rows = c.fetchall()
             for (lid,) in rows:
                 success, msg = await do_draw(lid, bot)
@@ -764,17 +765,14 @@ async def on_msg(update, ctx):
         with db_connect() as conn:
             c = conn.cursor()
             now = now_cn()
-            # 只显示未开奖且开奖时间未到的抽奖
             c.execute("SELECT id, title, prize, cost, draw_time FROM lotteries WHERE status=0 AND draw_time > ? ORDER BY draw_time ASC", (now.isoformat(),))
             rows = c.fetchall()
         if not rows:
             await update.message.reply_text("当前没有进行中的抽奖，请关注后续通知。")
             return
 
-        # 如果只有一个，直接显示详情
         if len(rows) == 1:
             lid, title, prize, cost, draw_time = rows[0]
-            # 检查用户是否已参与
             with db_connect() as conn2:
                 c2 = conn2.cursor()
                 c2.execute("SELECT 1 FROM lottery_participants WHERE lottery_id=? AND user_id=?", (lid, update.effective_user.id))
@@ -787,7 +785,6 @@ async def on_msg(update, ctx):
                     c3.execute("SELECT nickname FROM users WHERE user_id=?", (uid,))
                     nick = c3.fetchone()
                     names.append(nick[0] if nick else str(uid))
-            # 构建按钮
             btn_text = "🎟️ 参与抽奖" if not already else "✅ 已参与"
             btn_data = f"lottery_join_{lid}" if not already else None
             kb = Markup([[Btn(btn_text, callback_data=btn_data)]]) if btn_data else None
@@ -802,7 +799,6 @@ async def on_msg(update, ctx):
                 msg += "点击下方按钮参与！"
             await update.message.reply_text(msg, reply_markup=kb)
         else:
-            # 多个抽奖，简要列出，并提供参与最新的按钮
             lines = []
             for idx, (lid, title, prize, cost, draw_time) in enumerate(rows[:5], 1):
                 lines.append(f"{idx}. {title} | {prize} | {cost}学分 | {draw_time}")
