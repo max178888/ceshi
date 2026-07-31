@@ -11,11 +11,10 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 # ========== 中国时区 ==========
 CHINA_TZ = timezone(timedelta(hours=8))
 def now_cn():
-    """返回中国时区的当前时间（不带时区信息，方便存储和比较）"""
     return datetime.now(CHINA_TZ).replace(tzinfo=None)
 
 # ========== 配置 ==========
-TOKEN = "8179579064:AAF57RUAH5TVtrW4qdA4_wIAtWkRAAkqkvo"   # 请替换为你的Token
+TOKEN = "8179579064:AAF57RUAH5TVtrW4qdA4_wIAtWkRAAkqkvo"
 ALLOWED_GROUPS = [-1003002241602, -1003745425265, -1003720878201]
 ADMIN_IDS = [8354445328, 877039616, 42438298]
 
@@ -599,11 +598,13 @@ async def cmd_force_end_lottery(update, ctx):
         await update.message.reply_text("抽奖ID必须是数字。")
         return
 
-    success, msg = await do_draw(lid, ctx.bot)
+    success, msg = await do_draw(lid, ctx.bot, force=True)
     await update.message.reply_text(msg)
 
 # ========== 抽奖核心开奖函数 ==========
-async def do_draw(lottery_id, bot):
+async def do_draw(lottery_id, bot, force=False):
+    """执行开奖，发送结果到所有允许的群组。
+       force=True 强制开奖（即使无人参与也标记为已结束）"""
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("SELECT id, title, prize, cost, status, draw_time FROM lotteries WHERE id=?", (lottery_id,))
@@ -616,9 +617,13 @@ async def do_draw(lottery_id, bot):
         c.execute("SELECT user_id FROM lottery_participants WHERE lottery_id=?", (lid,))
         participants = [r[0] for r in c.fetchall()]
         if not participants:
-            c.execute("UPDATE lotteries SET status=1 WHERE id=?", (lid,))
-            conn.commit()
-            return False, "该抽奖暂无参与者，已标记为结束"
+            if force:
+                c.execute("UPDATE lotteries SET status=1 WHERE id=?", (lid,))
+                conn.commit()
+                return False, "该抽奖暂无参与者，已强制结束。"
+            else:
+                # 自动开奖时无人参与，不改变状态，返回提示
+                return False, "暂无参与者，未开奖，等待管理员处理。"
         winner = random.choice(participants)
         c.execute("UPDATE lotteries SET status=2, winner_id=? WHERE id=?", (winner, lid))
         conn.commit()
@@ -639,14 +644,19 @@ async def auto_draw_loop(bot):
     while True:
         try:
             now = now_cn()
-            threshold = now - timedelta(minutes=1)   # 1分钟缓冲
+            threshold = now - timedelta(minutes=1)  # 缓冲1分钟
             with db_connect() as conn:
                 c = conn.cursor()
                 c.execute("SELECT id FROM lotteries WHERE status=0 AND draw_time <= ?", (threshold.isoformat(),))
                 rows = c.fetchall()
             for (lid,) in rows:
-                success, msg = await do_draw(lid, bot)
-                print(f"自动开奖 {lid}: {msg}")
+                # 自动开奖不强制，若无人参与则保持状态不变
+                success, msg = await do_draw(lid, bot, force=False)
+                if success:
+                    print(f"自动开奖 {lid}: {msg}")
+                else:
+                    # 若因无参与者未开奖，只打印日志，状态保留
+                    print(f"自动开奖 {lid}: {msg}")
         except Exception as e:
             print(f"自动开奖循环出错: {e}")
         await asyncio.sleep(60)
@@ -670,7 +680,7 @@ async def cmd_start(update, ctx):
                 "\n🎰 抽奖管理（私聊）：\n"
                 "/cj <标题> <奖品> <消耗学分> <开奖时间> - 创建抽奖\n"
                 "/cjlist - 查看所有抽奖\n"
-                "/qx <抽奖ID> - 手动开奖"
+                "/qx <抽奖ID> - 手动开奖（强制）"
             )
             await update.message.reply_text(help_text)
         else:
@@ -765,14 +775,19 @@ async def on_msg(update, ctx):
         with db_connect() as conn:
             c = conn.cursor()
             now = now_cn()
-            c.execute("SELECT id, title, prize, cost, draw_time FROM lotteries WHERE status=0 AND draw_time > ? ORDER BY draw_time ASC", (now.isoformat(),))
+            # 查询所有状态为0（未结束）的抽奖，按开奖时间排序
+            c.execute("SELECT id, title, prize, cost, draw_time FROM lotteries WHERE status=0 ORDER BY draw_time ASC")
             rows = c.fetchall()
         if not rows:
-            await update.message.reply_text("当前没有进行中的抽奖，请关注后续通知。")
+            await update.message.reply_text("当前没有任何抽奖活动，请关注后续通知。")
             return
 
+        # 如果只有一个，直接显示
         if len(rows) == 1:
             lid, title, prize, cost, draw_time = rows[0]
+            if isinstance(draw_time, str):
+                draw_time = datetime.fromisoformat(draw_time)
+            expired = now > draw_time
             with db_connect() as conn2:
                 c2 = conn2.cursor()
                 c2.execute("SELECT 1 FROM lottery_participants WHERE lottery_id=? AND user_id=?", (lid, update.effective_user.id))
@@ -785,29 +800,48 @@ async def on_msg(update, ctx):
                     c3.execute("SELECT nickname FROM users WHERE user_id=?", (uid,))
                     nick = c3.fetchone()
                     names.append(nick[0] if nick else str(uid))
-            btn_text = "🎟️ 参与抽奖" if not already else "✅ 已参与"
-            btn_data = f"lottery_join_{lid}" if not already else None
-            kb = Markup([[Btn(btn_text, callback_data=btn_data)]]) if btn_data else None
+            if expired:
+                btn = None
+                btn_text = "⏰ 已截止"
+            else:
+                btn_text = "🎟️ 参与抽奖" if not already else "✅ 已参与"
+                btn_data = f"lottery_join_{lid}" if not already else None
+                btn = Btn(btn_text, callback_data=btn_data) if btn_data else None
+            kb = Markup([[btn]]) if btn else None
             msg = f"🎰 当前抽奖活动\n标题：{title}\n奖品：{prize}\n消耗：{cost} 学分\n开奖时间：{draw_time}\n"
             if names:
                 msg += f"👥 已参与（{len(names)}人）：{', '.join(names)}\n"
             else:
                 msg += "👥 暂无人参与\n"
-            if already:
+            if expired:
+                msg += "⏰ 该抽奖已过开奖时间，无法参与，请等待管理员处理。"
+            elif already:
                 msg += "你已参与，请等待开奖。"
             else:
                 msg += "点击下方按钮参与！"
             await update.message.reply_text(msg, reply_markup=kb)
         else:
+            # 多个抽奖，逐个显示并附带参与按钮（仅未过期的）
+            # 为了不超出消息长度，只显示前5个，并提示更多
             lines = []
+            buttons = []
             for idx, (lid, title, prize, cost, draw_time) in enumerate(rows[:5], 1):
-                lines.append(f"{idx}. {title} | {prize} | {cost}学分 | {draw_time}")
+                if isinstance(draw_time, str):
+                    draw_time = datetime.fromisoformat(draw_time)
+                expired = now > draw_time
+                status_text = "⏰已截止" if expired else "🟢可参与"
+                lines.append(f"{idx}. {title} | {prize} | {cost}学分 | {draw_time} {status_text}")
+                if not expired:
+                    # 为每个未过期的抽奖添加一个参与按钮（但按钮过多可能被限制，我们只给第一个）
+                    if idx == 1:
+                        buttons.append([Btn(f"🎟️ 参与第{idx}个", callback_data=f"lottery_join_{lid}")])
             reply = "🎰 当前有多个抽奖：\n" + "\n".join(lines)
             if len(rows) > 5:
-                reply += f"\n... 共{len(rows)}个，请发送「抽奖」刷新查看最新。"
-            first_lid = rows[0][0]
-            join_btn = Btn("🎟️ 参与第一个抽奖", callback_data=f"lottery_join_{first_lid}")
-            kb = Markup([[join_btn]])
+                reply += f"\n... 共{len(rows)}个，发送「抽奖」刷新查看。"
+            if buttons:
+                kb = Markup(buttons)
+            else:
+                kb = None
             await update.message.reply_text(reply, reply_markup=kb)
         return
 
