@@ -80,6 +80,9 @@ def init_db():
         if "remaining" not in cols:
             c.execute("ALTER TABLE global_limits ADD COLUMN remaining INT DEFAULT 0")
         c.execute("INSERT OR IGNORE INTO global_limits (item_id, remaining) VALUES (3, 1)")
+        # ------- 抽奖表 -------
+        c.execute("CREATE TABLE IF NOT EXISTS lotteries (id INTEGER PRIMARY KEY AUTOINCREMENT, prize TEXT, cost REAL, draw_time TIMESTAMP, status INTEGER DEFAULT 0, winner_id INTEGER, created_by INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        c.execute("CREATE TABLE IF NOT EXISTS lottery_participants (lottery_id INTEGER, user_id INTEGER, participated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (lottery_id, user_id))")
         conn.commit()
 
 # ---------- 用户函数 ----------
@@ -163,7 +166,7 @@ def get_remaining(item_id):
         c = conn.cursor()
         c.execute("SELECT remaining FROM global_limits WHERE item_id=?", (item_id,))
         row = c.fetchone()
-        return row[0] if row else None   # None 表示无限量
+        return row[0] if row else None
 
 def decrease_remaining(item_id):
     with db_connect() as conn:
@@ -240,7 +243,6 @@ async def cb(update, ctx):
         _, n, p = item
         current = get_coins(uid)
 
-        # 统一限量检查
         remaining = get_remaining(iid)
         if remaining is not None and remaining <= 0:
             await query.edit_message_text(
@@ -264,7 +266,6 @@ async def cb(update, ctx):
                 f"✅ {n} 兑换成功！消耗 {p} 学分",
                 reply_markup=Markup([[Btn("🔙 返回钱包", callback_data="back")]])
             )
-            # 群组公开通知（不带@管理员）
             if update.effective_chat.type in ('group', 'supergroup'):
                 try:
                     msg = f"🎉 {name} 成功兑换了 {n}！消耗 {p} 学分。"
@@ -275,7 +276,6 @@ async def cb(update, ctx):
                     )
                 except Exception as e:
                     print(f"群组通知发送失败: {e}")
-            # 私聊通知每位管理员
             for aid in ADMIN_IDS:
                 try:
                     admin_msg = f"用户 {name}（ID: {uid}）兑换了 {n}，消耗 {p} 学分。"
@@ -285,7 +285,6 @@ async def cb(update, ctx):
                     )
                 except Exception as e:
                     print(f"私聊管理员 {aid} 失败: {e}")
-            # 私聊购买记录
             try:
                 await ctx.bot.send_message(
                     chat_id=uid,
@@ -423,7 +422,176 @@ async def admin_del_item(update, ctx):
             conn.commit()
         await update.message.reply_text(f"✅ 商品ID {gid} 已删除。")
 
-# ========== 普通命令 ==========
+# ========== 抽奖功能（新增） ==========
+# ---- 管理员私聊命令 ----
+async def create_lottery(update, ctx):
+    """创建抽奖：/create_lottery <奖品描述> <消耗学分> <开奖时间 YYYY-MM-DD HH:MM>"""
+    if update.effective_chat.type != 'private':
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    args = ctx.args
+    if len(args) != 3:
+        await update.message.reply_text("用法：/create_lottery <奖品描述> <消耗学分> <开奖时间>\n例如：/create_lottery iPhone15 50 2026-08-01 20:00")
+        return
+    prize = args[0]
+    try:
+        cost = float(args[1])
+        if cost <= 0:
+            raise ValueError
+        draw_time = datetime.strptime(args[2], "%Y-%m-%d %H:%M")
+        if draw_time <= datetime.now():
+            await update.message.reply_text("开奖时间必须在未来。")
+            return
+    except ValueError:
+        await update.message.reply_text("消耗学分必须是正数，时间格式为 YYYY-MM-DD HH:MM")
+        return
+
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO lotteries (prize, cost, draw_time, status, created_by) VALUES (?, ?, ?, 0, ?)",
+                  (prize, cost, draw_time, update.effective_user.id))
+        lid = c.lastrowid
+        conn.commit()
+    await update.message.reply_text(f"✅ 抽奖已创建！ID: {lid}\n奖品：{prize}\n消耗：{cost} 学分\n开奖时间：{draw_time.strftime('%Y-%m-%d %H:%M')}")
+
+async def list_lotteries(update, ctx):
+    """列出所有抽奖：/list_lotteries"""
+    if update.effective_chat.type != 'private':
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, prize, cost, draw_time, status, winner_id FROM lotteries ORDER BY id DESC")
+        rows = c.fetchall()
+    if not rows:
+        await update.message.reply_text("暂无抽奖记录。")
+        return
+    status_map = {0: "⏳ 未开始", 1: "🔚 已结束", 2: "🏆 已开奖"}
+    text = "📋 抽奖列表：\n"
+    for row in rows:
+        lid, prize, cost, dt, status, winner = row
+        status_str = status_map.get(status, "未知")
+        text += f"ID:{lid} | {prize} | 消耗{cost} | {dt} | {status_str}"
+        if winner:
+            with db_connect() as conn2:
+                c2 = conn2.cursor()
+                c2.execute("SELECT nickname FROM users WHERE user_id=?", (winner,))
+                w = c2.fetchone()
+                winner_name = w[0] if w else str(winner)
+            text += f" | 获奖者：{winner_name}"
+        text += "\n"
+    await update.message.reply_text(text)
+
+async def end_lottery(update, ctx):
+    """手动开奖：/end_lottery <抽奖ID>"""
+    if update.effective_chat.type != 'private':
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    args = ctx.args
+    if len(args) != 1:
+        await update.message.reply_text("用法：/end_lottery <抽奖ID>")
+        return
+    try:
+        lid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("抽奖ID必须是数字。")
+        return
+
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, prize, cost, status, draw_time FROM lotteries WHERE id=?", (lid,))
+        row = c.fetchone()
+        if not row:
+            await update.message.reply_text("抽奖不存在。")
+            return
+        lid, prize, cost, status, draw_time = row
+        if status != 0:
+            await update.message.reply_text("该抽奖已结束或已开奖。")
+            return
+        # 获取参与者
+        c.execute("SELECT user_id FROM lottery_participants WHERE lottery_id=?", (lid,))
+        participants = [r[0] for r in c.fetchall()]
+        if not participants:
+            await update.message.reply_text("该抽奖暂无参与者，无法开奖。")
+            # 可考虑直接标记结束
+            c.execute("UPDATE lotteries SET status=1 WHERE id=?", (lid,))
+            conn.commit()
+            return
+        # 随机抽取一名
+        winner = random.choice(participants)
+        # 更新抽奖状态
+        c.execute("UPDATE lotteries SET status=2, winner_id=? WHERE id=?", (winner, lid))
+        conn.commit()
+        # 获取获奖者昵称
+        c.execute("SELECT nickname FROM users WHERE user_id=?", (winner,))
+        wrow = c.fetchone()
+        winner_name = wrow[0] if wrow else str(winner)
+
+    # 发送开奖结果到所有允许的群组
+    msg = f"🎉 抽奖开奖结果！\n奖品：{prize}\n获奖者：{winner_name}\n恭喜！"
+    for gid in ALLOWED_GROUPS:
+        try:
+            await ctx.bot.send_message(chat_id=gid, text=msg, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            print(f"发送开奖结果到 {gid} 失败: {e}")
+    # 私聊通知管理员
+    await update.message.reply_text(f"✅ 抽奖 {lid} 已开奖，获奖者：{winner_name}")
+
+# ---- 用户参与抽奖（群聊发送“抽奖”）----
+async def lottery_participate(update, ctx):
+    """处理群聊中的“抽奖”关键词"""
+    if update.message.from_user.is_bot:
+        return
+    if update.effective_chat.type not in ('group', 'supergroup'):
+        return
+    if update.effective_chat.id not in ALLOWED_GROUPS:
+        return
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+    if text != "抽奖":
+        return  # 不匹配，不处理
+
+    uid = update.message.from_user.id
+    name = update.message.from_user.first_name
+    get_user(uid, name)  # 确保用户存在
+
+    # 查找当前进行中的抽奖（status=0 且 draw_time > now）
+    with db_connect() as conn:
+        c = conn.cursor()
+        now = datetime.now()
+        c.execute("SELECT id, prize, cost FROM lotteries WHERE status=0 AND draw_time > ? ORDER BY id LIMIT 1", (now,))
+        row = c.fetchone()
+        if not row:
+            await update.message.reply_text("当前没有进行中的抽奖，请关注后续通知。")
+            return
+        lid, prize, cost = row
+        # 检查用户是否已参与
+        c.execute("SELECT 1 FROM lottery_participants WHERE lottery_id=? AND user_id=?", (lid, uid))
+        if c.fetchone():
+            await update.message.reply_text("你已经参与过本次抽奖，请勿重复参与。")
+            return
+        # 检查学分
+        bal = get_coins(uid)
+        if bal < cost:
+            await update.message.reply_text(f"学分不足！参与需要 {cost} 学分，你只有 {bal:.2f} 学分。")
+            return
+        # 扣除学分
+        if not sub_coins(uid, cost, f"参与抽奖 {prize}"):
+            await update.message.reply_text("扣学分失败，请稍后再试。")
+            return
+        # 记录参与
+        c.execute("INSERT INTO lottery_participants (lottery_id, user_id) VALUES (?, ?)", (lid, uid))
+        conn.commit()
+    await update.message.reply_text(f"✅ 成功参与抽奖！奖品：{prize}，消耗 {cost} 学分。祝你好运！")
+
+# ========== 原有命令 ==========
 async def cmd_start(update, ctx):
     if update.message.from_user.is_bot:
         return
@@ -438,7 +606,11 @@ async def cmd_start(update, ctx):
                 "/学分 +数字 或 /学分 -数字 - 修改用户学分（需回复用户消息）\n"
                 "/coins - 查询自己学分\n"
                 "/shop - 打开商城\n"
-                "/start - 显示本帮助"
+                "/start - 显示本帮助\n"
+                "🎰 抽奖管理（私聊）：\n"
+                "/create_lottery <奖品> <消耗学分> <开奖时间> - 创建抽奖\n"
+                "/list_lotteries - 查看所有抽奖\n"
+                "/end_lottery <抽奖ID> - 手动开奖"
             )
             await update.message.reply_text(help_text)
         else:
@@ -577,7 +749,6 @@ async def on_msg(update, ctx):
                       (round_id, uid, amount, bet_type, None))
             conn.commit()
 
-        # 美化投注成功消息
         end_time = datetime.fromisoformat(state['end_time'])
         remaining_seconds = max(0, int((end_time - datetime.now()).total_seconds()))
         date_str = datetime.now().strftime('%m月%d日')
@@ -795,6 +966,11 @@ def main():
     app.add_handler(CommandHandler("additem", admin_add_item))
     app.add_handler(CommandHandler("listitems", admin_list_items))
     app.add_handler(CommandHandler("delitem", admin_del_item))
+    # ---- 抽奖功能注册 ----
+    app.add_handler(CommandHandler("create_lottery", create_lottery))
+    app.add_handler(CommandHandler("list_lotteries", list_lotteries))
+    app.add_handler(CommandHandler("end_lottery", end_lottery))
+    app.add_handler(MessageHandler(filters.Regex(r'^抽奖$'), lottery_participate))  # 优先匹配，放在on_msg之前
     app.run_polling(allowed_updates=["message", "callback_query"])
 
 if __name__ == "__main__":
