@@ -3,13 +3,21 @@ import random
 import sqlite3
 import re
 import asyncio
+import time
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler
 
+# ========== 设置时区为中国时区（仅影响 datetime.now()）==========
+os.environ['TZ'] = 'Asia/Shanghai'
+try:
+    time.tzset()
+except AttributeError:
+    pass  # Windows 不支持，但可忽略
+
 # ========== 配置 ==========
-TOKEN = "8179579064:AAF57RUAH5TVtrW4qdA4_wIAtWkRAAkqkvo"  # 请替换为实际Token
+TOKEN = "8179579064:AAF57RUAH5TVtrW4qdA4_wIAtWkRAAkqkvo"
 ALLOWED_GROUPS = [-1003002241602, -1003745425265, -1003720878201]
 ADMIN_IDS = [8354445328, 877039616, 42438298]
 
@@ -486,13 +494,11 @@ async def cmd_create_lottery(update, ctx):
         return
 
     text = update.message.text.strip()
-    # 移除命令前缀
     if text.startswith('/cj'):
         content = text[3:].strip()
     else:
         content = text
 
-    # 用正则提取时间 (YYYY-MM-DD HH:MM)
     time_pattern = r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})'
     match = re.search(time_pattern, content)
     if not match:
@@ -511,9 +517,7 @@ async def cmd_create_lottery(update, ctx):
         await update.message.reply_text("时间格式无效，请使用 YYYY-MM-DD HH:MM")
         return
 
-    # 从 content 中移除时间部分
     rest = content.replace(draw_time_str, '').strip()
-    # 分割剩余部分，最后一个是学分，前面是标题和奖品
     parts = rest.split()
     if len(parts) < 2:
         await update.message.reply_text("格式错误，请提供：标题、奖品、消耗学分")
@@ -527,7 +531,6 @@ async def cmd_create_lottery(update, ctx):
         return
 
     title = parts[0]
-    # 奖品：中间部分（如果多于2个词，则合并；否则为"未命名"）
     if len(parts) > 2:
         prize = ' '.join(parts[1:-1])
     else:
@@ -594,24 +597,27 @@ async def cmd_force_end_lottery(update, ctx):
         await update.message.reply_text("抽奖ID必须是数字。")
         return
 
+    await do_draw(lid, ctx.bot)  # 复用开奖逻辑
+
+# ========== 抽奖核心开奖函数 ==========
+async def do_draw(lottery_id, bot):
+    """执行开奖，发送结果到所有允许的群组，返回是否成功"""
     with db_connect() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, title, prize, cost, status, draw_time FROM lotteries WHERE id=?", (lid,))
+        c.execute("SELECT id, title, prize, cost, status, draw_time FROM lotteries WHERE id=?", (lottery_id,))
         row = c.fetchone()
         if not row:
-            await update.message.reply_text("抽奖不存在。")
-            return
+            return False, "抽奖不存在"
         lid, title, prize, cost, status, draw_time = row
         if status != 0:
-            await update.message.reply_text("该抽奖已结束或已开奖。")
-            return
+            return False, "该抽奖已结束或已开奖"
+        # 获取参与者
         c.execute("SELECT user_id FROM lottery_participants WHERE lottery_id=?", (lid,))
         participants = [r[0] for r in c.fetchall()]
         if not participants:
-            await update.message.reply_text("该抽奖暂无参与者，无法开奖。")
             c.execute("UPDATE lotteries SET status=1 WHERE id=?", (lid,))
             conn.commit()
-            return
+            return False, "该抽奖暂无参与者，已标记为结束"
         winner = random.choice(participants)
         c.execute("UPDATE lotteries SET status=2, winner_id=? WHERE id=?", (winner, lid))
         conn.commit()
@@ -622,10 +628,28 @@ async def cmd_force_end_lottery(update, ctx):
     msg = f"🎉 抽奖开奖结果！\n标题：{title}\n奖品：{prize}\n获奖者：{winner_name}\n恭喜！"
     for gid in ALLOWED_GROUPS:
         try:
-            await ctx.bot.send_message(chat_id=gid, text=msg, parse_mode=ParseMode.HTML)
+            await bot.send_message(chat_id=gid, text=msg, parse_mode=ParseMode.HTML)
         except Exception as e:
             print(f"发送开奖结果到 {gid} 失败: {e}")
-    await update.message.reply_text(f"✅ 抽奖 {lid} 已开奖，获奖者：{winner_name}")
+    return True, f"抽奖 {lid} 已开奖，获奖者：{winner_name}"
+
+# ========== 后台自动开奖任务 ==========
+async def auto_draw_loop(bot):
+    """每分钟检查一次是否有到期的抽奖并自动开奖"""
+    while True:
+        try:
+            now = datetime.now()
+            with db_connect() as conn:
+                c = conn.cursor()
+                # 查找 status=0 且 draw_time <= now
+                c.execute("SELECT id FROM lotteries WHERE status=0 AND draw_time <= ?", (now.isoformat(),))
+                rows = c.fetchall()
+            for (lid,) in rows:
+                success, msg = await do_draw(lid, bot)
+                print(f"自动开奖 {lid}: {msg}")
+        except Exception as e:
+            print(f"自动开奖循环出错: {e}")
+        await asyncio.sleep(60)  # 每分钟检查一次
 
 # ========== 普通命令 ==========
 async def cmd_start(update, ctx):
@@ -747,11 +771,30 @@ async def on_msg(update, ctx):
                 await update.message.reply_text("当前没有进行中的抽奖，请关注后续通知。")
                 return
             lid, title, prize, cost, draw_time = row
+            # 检查用户是否已参与
             c.execute("SELECT 1 FROM lottery_participants WHERE lottery_id=? AND user_id=?", (lid, update.effective_user.id))
             already = c.fetchone() is not None
+            # 获取所有参与者列表
+            c.execute("SELECT user_id FROM lottery_participants WHERE lottery_id=?", (lid,))
+            participants = [p[0] for p in c.fetchall()]
+            participant_names = []
+            for uid in participants:
+                c2 = conn.cursor()
+                c2.execute("SELECT nickname FROM users WHERE user_id=?", (uid,))
+                nick = c2.fetchone()
+                if nick:
+                    participant_names.append(nick[0])
+                else:
+                    participant_names.append(str(uid))
+        # 构造显示
         join_btn = Btn("🎟️ 参与抽奖", callback_data=f"lottery_join_{lid}")
         kb = Markup([[join_btn]])
-        msg = f"🎰 当前抽奖活动\n标题：{title}\n奖品：{prize}\n消耗：{cost} 学分\n开奖时间：{draw_time}\n" + ("（你已参与）" if already else "点击下方按钮参与！")
+        msg = f"🎰 当前抽奖活动\n标题：{title}\n奖品：{prize}\n消耗：{cost} 学分\n开奖时间：{draw_time}\n"
+        if participant_names:
+            msg += f"👥 已参与（{len(participant_names)}人）：{', '.join(participant_names)}\n"
+        else:
+            msg += "👥 暂无人参与\n"
+        msg += "（你已参与）" if already else "点击下方按钮参与！"
         await update.message.reply_text(msg, reply_markup=kb)
         return
 
@@ -1006,6 +1049,11 @@ async def dice_stats(update, ctx):
 def main():
     init_db()
     app = Application.builder().token(TOKEN).build()
+    # 启动后台自动开奖任务
+    bot = app.bot
+    loop = asyncio.get_event_loop()
+    loop.create_task(auto_draw_loop(bot))
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("coins", cmd_coins))
     app.add_handler(CommandHandler("shop", cmd_shop))
