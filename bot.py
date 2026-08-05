@@ -97,10 +97,9 @@ def init_db():
                 winner_id INTEGER,
                 created_by INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                channel_id TEXT      -- 新增：可选频道ID或@username
+                channel_id TEXT
             )
         """)
-        # 如果表已存在但缺少 channel_id 列，则添加
         c.execute("PRAGMA table_info(lotteries)")
         existing_cols = [col[1] for col in c.fetchall()]
         if "channel_id" not in existing_cols:
@@ -112,6 +111,16 @@ def init_db():
                 user_id INTEGER,
                 participated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (lottery_id, user_id)
+            )
+        """)
+
+        # ----- 新增：记录群聊中已发送的“未关注频道”提示 -----
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS lottery_fail_notify (
+                lottery_id INTEGER,
+                user_id INTEGER,
+                chat_id INTEGER,
+                PRIMARY KEY (lottery_id, user_id, chat_id)
             )
         """)
         conn.commit()
@@ -350,15 +359,37 @@ async def cb(update, ctx):
             # 检查是否已参与
             c.execute("SELECT 1 FROM lottery_participants WHERE lottery_id=? AND user_id=?", (lottery_id, uid))
             if c.fetchone():
-                await query.answer("您已参与过本次抽奖", show_alert=True)   # 仅弹窗提示，不修改按钮
+                await query.answer("您已参与过本次抽奖", show_alert=True)
                 return
 
             # 频道关注校验（如果设置了 channel_id）
             if channel_id:
                 try:
-                    # 尝试获取用户在频道的成员信息
                     member = await ctx.bot.get_chat_member(chat_id=channel_id, user_id=uid)
                     if member.status not in ['member', 'administrator', 'creator']:
+                        # 未关注，发送一次性群聊提示（如果是在群组中）
+                        if query.message.chat.type in ('group', 'supergroup'):
+                            chat_id = query.message.chat.id
+                            # 检查是否已发送过通知
+                            with db_connect() as conn2:
+                                c2 = conn2.cursor()
+                                c2.execute("SELECT 1 FROM lottery_fail_notify WHERE lottery_id=? AND user_id=? AND chat_id=?",
+                                           (lottery_id, uid, chat_id))
+                                if not c2.fetchone():
+                                    # 发送提示
+                                    try:
+                                        mention = f'<a href="tg://user?id={uid}">{name}</a>'
+                                        await ctx.bot.send_message(
+                                            chat_id=chat_id,
+                                            text=f"⚠️ {mention} 参与抽奖「{title}」需要先关注频道 {channel_id}，请关注后再次尝试。",
+                                            parse_mode=ParseMode.HTML
+                                        )
+                                        # 记录已发送
+                                        c2.execute("INSERT INTO lottery_fail_notify (lottery_id, user_id, chat_id) VALUES (?,?,?)",
+                                                   (lottery_id, uid, chat_id))
+                                        conn2.commit()
+                                    except Exception as e:
+                                        print(f"发送群聊提示失败: {e}")
                         await query.answer(f"❌ 请先关注频道 {channel_id} 再来参与", show_alert=True)
                         return
                 except Exception as e:
@@ -389,9 +420,7 @@ async def cb(update, ctx):
         except Exception:
             pass
 
-        # 在群聊中回复一条临时消息（可选），但为了不打扰，可以省略，或发一条“xxx 已参与”消息，但用户要求“只增加参与人姓名和私聊回复”，所以我们选择编辑原消息更新名单，但保留按钮不变
-        # 以下是编辑原消息文本，更新参与者名单，但不改变按钮
-        # 获取最新的参与者列表
+        # 更新原消息的参与者名单，保留按钮
         with db_connect() as conn2:
             c2 = conn2.cursor()
             c2.execute("SELECT user_id FROM lottery_participants WHERE lottery_id=?", (lottery_id,))
@@ -403,11 +432,11 @@ async def cb(update, ctx):
                 nick = c3.fetchone()
                 names.append(nick[0] if nick else str(pid))
 
-        # 重新构建消息文本（注意：原消息可能还包含按钮，我们保留原 reply_markup）
         expired = now_cn() > draw_time
-        already = uid in participants  # 刚刚加入，所以为True
-        # 构建文本
+        already = True  # 刚加入，所以已参与
         msg_text = f"🎰 当前抽奖活动\n标题：{title}\n奖品：{prize}\n消耗：{cost} 学分\n开奖时间：{draw_time}\n"
+        if channel_id:
+            msg_text += f"📢 参与条件：需关注频道 {channel_id}\n"
         if names:
             msg_text += f"👥 已参与（{len(names)}人）：{', '.join(names)}\n"
         else:
@@ -419,15 +448,12 @@ async def cb(update, ctx):
         else:
             msg_text += "点击下方按钮参与！"
 
-        # 获取原消息的 reply_markup（保留原按钮）
         original_markup = query.message.reply_markup
-        # 编辑消息，只改文本，保留按钮
         try:
             await query.edit_message_text(msg_text, reply_markup=original_markup, parse_mode=ParseMode.HTML)
         except Exception as e:
             print(f"编辑抽奖消息失败: {e}")
 
-        # 响应回调（不显示额外提示，因为已经有私聊了）
         await query.answer("✅ 参与成功！", show_alert=False)
 
 # ========== 测试回调 ==========
@@ -568,14 +594,12 @@ async def cmd_create_lottery(update, ctx):
     # 解析可选频道参数 -c @channel 或 -c -100xxx
     channel_id = None
     parts = content.split()
-    # 查找 -c 选项
     if '-c' in parts:
         idx = parts.index('-c')
         if idx + 1 < len(parts):
             channel_id = parts[idx + 1]
-            # 移除这两个元素
             parts.pop(idx)
-            parts.pop(idx)  # 注意 idx 仍指向原位置，因为删掉了一个元素，所以再次删除 idx 即可
+            parts.pop(idx)
         content = ' '.join(parts)
 
     # 提取时间
@@ -618,6 +642,36 @@ async def cmd_create_lottery(update, ctx):
         prize = ' '.join(parts[1:-1])
     else:
         prize = "未命名奖品"
+
+    # 如果设置了频道，检查机器人是否在频道内
+    if channel_id:
+        try:
+            chat = await ctx.bot.get_chat(channel_id)
+            # 如果能获取到，说明机器人在频道内（public频道）或已加入
+            # 但为了确保有权限获取成员，再尝试获取bot自身成员信息
+            try:
+                me = await ctx.bot.get_me()
+                member = await ctx.bot.get_chat_member(chat_id=channel_id, user_id=me.id)
+                if member.status not in ['administrator', 'creator']:
+                    await update.message.reply_text(
+                        f"⚠️ 机器人在频道 {channel_id} 中，但不是管理员，无法校验成员关注状态。\n"
+                        f"请将机器人设为管理员后再试。"
+                    )
+                    return
+            except Exception as e:
+                # 可能无法获取自身信息，说明机器人不在频道
+                await update.message.reply_text(
+                    f"❌ 机器人不在频道 {channel_id} 中，或无法获取频道信息。\n"
+                    f"请先将机器人加入该频道并设为管理员，然后重新创建抽奖。\n"
+                    f"错误详情: {e}"
+                )
+                return
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ 无法访问频道 {channel_id}，请确认频道存在且机器人已加入。\n"
+                f"错误详情: {e}"
+            )
+            return
 
     # 插入数据库
     with db_connect() as conn:
@@ -718,7 +772,7 @@ async def do_draw(lottery_id, bot, force=False):
             print(f"发送开奖结果到 {gid} 失败: {e}")
     return True, f"抽奖 {lid} 已开奖，获奖者：{winner_name}"
 
-# ========== 后台自动开奖任务（稳定版） ==========
+# ========== 后台自动开奖任务 ==========
 async def auto_draw_loop(bot):
     while True:
         try:
@@ -739,7 +793,6 @@ async def auto_draw_loop(bot):
                     else:
                         print(f"自动开奖 {lid}: {msg}")
                 elif draw_time <= now:
-                    # 已过期超过2分钟，保持状态，留待管理员手动
                     pass
         except Exception as e:
             print(f"自动开奖循环出错: {e}")
@@ -860,8 +913,8 @@ async def on_msg(update, ctx):
             await update.message.reply_text("当前没有任何抽奖活动，请关注后续通知。")
             return
 
-        if len(rows) == 1:
-            lid, title, prize, cost, draw_time, channel_id = rows[0]
+        # 为每个抽奖单独发送消息
+        for lid, title, prize, cost, draw_time, channel_id in rows:
             if isinstance(draw_time, str):
                 draw_time = datetime.fromisoformat(draw_time)
             expired = now_cn() > draw_time
@@ -891,25 +944,8 @@ async def on_msg(update, ctx):
                 msg += "⏰ 该抽奖已过开奖时间，无法参与。"
             else:
                 msg += "点击下方按钮参与！"
+            # 发送单独的消息
             await update.message.reply_text(msg, reply_markup=kb)
-        else:
-            # 多个抽奖，只显示第一个（简化）
-            lines = []
-            for idx, (lid, title, prize, cost, draw_time, channel) in enumerate(rows[:3], 1):
-                if isinstance(draw_time, str):
-                    draw_time = datetime.fromisoformat(draw_time)
-                expired = now_cn() > draw_time
-                status_text = "⏰已截止" if expired else "🟢可参与"
-                ch_text = f" [频道:{channel}]" if channel else ""
-                lines.append(f"{idx}. {title} | {prize} | {cost}学分 | {draw_time} {status_text}{ch_text}")
-            reply = "🎰 当前有多个抽奖：\n" + "\n".join(lines)
-            if len(rows) > 3:
-                reply += f"\n... 共{len(rows)}个，发送「抽奖」刷新查看。"
-            # 提供参与第一个的按钮
-            first_lid = rows[0][0]
-            join_btn = Btn("🎟️ 参与第一个抽奖", callback_data=f"lottery_join_{first_lid}")
-            kb = Markup([[join_btn]])
-            await update.message.reply_text(reply, reply_markup=kb)
         return
 
     if text.startswith('/'):
