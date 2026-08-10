@@ -67,6 +67,7 @@ def db_connect():
 def init_db():
     with db_connect() as conn:
         c = conn.cursor()
+        # 已有表保持不变
         c.execute("CREATE TABLE IF NOT EXISTS users (user_id INT PRIMARY KEY, nickname TEXT, coins REAL)")
         c.execute("CREATE TABLE IF NOT EXISTS daily (user_id INT, date TEXT, gain REAL, PRIMARY KEY(user_id, date))")
         c.execute("CREATE TABLE IF NOT EXISTS tx (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INT, type TEXT, amount REAL, desc TEXT, ts TIMESTAMP)")
@@ -84,6 +85,7 @@ def init_db():
             c.execute("ALTER TABLE global_limits ADD COLUMN remaining INT DEFAULT 0")
         c.execute("INSERT OR IGNORE INTO global_limits (item_id, remaining) VALUES (3, 1)")
 
+        # ----- 抽奖表，增加 need_msgs 和 msg_count -----
         c.execute("""
             CREATE TABLE IF NOT EXISTS lotteries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,13 +97,20 @@ def init_db():
                 winner_id INTEGER,
                 created_by INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                channel_id TEXT
+                channel_id TEXT,
+                need_msgs INTEGER DEFAULT 0,
+                msg_count INTEGER DEFAULT 0
             )
         """)
+        # 如果表已存在但缺少新列，则添加
         c.execute("PRAGMA table_info(lotteries)")
         existing_cols = [col[1] for col in c.fetchall()]
         if "channel_id" not in existing_cols:
             c.execute("ALTER TABLE lotteries ADD COLUMN channel_id TEXT")
+        if "need_msgs" not in existing_cols:
+            c.execute("ALTER TABLE lotteries ADD COLUMN need_msgs INTEGER DEFAULT 0")
+        if "msg_count" not in existing_cols:
+            c.execute("ALTER TABLE lotteries ADD COLUMN msg_count INTEGER DEFAULT 0")
 
         c.execute("""
             CREATE TABLE IF NOT EXISTS lottery_participants (
@@ -337,12 +346,12 @@ async def cb(update, ctx):
         lottery_id = int(data.split("_")[2])
         with db_connect() as conn:
             c = conn.cursor()
-            c.execute("SELECT title, prize, cost, status, draw_time, channel_id FROM lotteries WHERE id=?", (lottery_id,))
+            c.execute("SELECT title, prize, cost, status, draw_time, channel_id, need_msgs FROM lotteries WHERE id=?", (lottery_id,))
             row = c.fetchone()
             if not row:
                 await query.answer("❌ 抽奖不存在", show_alert=True)
                 return
-            title, prize, cost, status, draw_time, channel_id = row
+            title, prize, cost, status, draw_time, channel_id, need_msgs = row
             if isinstance(draw_time, str):
                 draw_time = datetime.fromisoformat(draw_time)
             if status != 0:
@@ -352,11 +361,13 @@ async def cb(update, ctx):
                 await query.answer("❌ 该抽奖已过开奖时间", show_alert=True)
                 return
 
+            # 检查是否已参与
             c.execute("SELECT 1 FROM lottery_participants WHERE lottery_id=? AND user_id=?", (lottery_id, uid))
             if c.fetchone():
                 await query.answer("您已参与过本次抽奖", show_alert=True)
                 return
 
+            # 频道关注校验
             if channel_id:
                 try:
                     member = await ctx.bot.get_chat_member(chat_id=channel_id, user_id=uid)
@@ -419,11 +430,12 @@ async def cb(update, ctx):
 
         expired = now_cn() > draw_time
         already = True
-        # 显示奖品时，将逗号替换为顿号
         display_prize = prize.replace(',', '、').replace('，', '、')
         msg_text = f"🎰 当前抽奖活动\n标题：{title}\n奖品：{display_prize}\n消耗：{cost} 学分\n开奖时间：{draw_time}\n"
         if channel_id:
             msg_text += f"📢 参与条件：需关注频道 {channel_id}\n"
+        if need_msgs > 0:
+            msg_text += f"💬 需群内发言数 ≥ {need_msgs} 条（已统计中）\n"
         if names:
             msg_text += f"👥 已参与（{len(names)}人）：{', '.join(names)}\n"
         else:
@@ -578,22 +590,37 @@ async def cmd_create_lottery(update, ctx):
     else:
         content = text
 
+    # 解析参数：-c 频道, -f 发言数
     channel_id = None
+    need_msgs = 0
     parts = content.split()
+    # 处理 -c
     if '-c' in parts:
         idx = parts.index('-c')
         if idx + 1 < len(parts):
             channel_id = parts[idx + 1]
             parts.pop(idx)
             parts.pop(idx)
-        content = ' '.join(parts)
+    # 处理 -f
+    if '-f' in parts:
+        idx = parts.index('-f')
+        if idx + 1 < len(parts):
+            try:
+                need_msgs = int(parts[idx + 1])
+                if need_msgs < 0:
+                    need_msgs = 0
+            except ValueError:
+                need_msgs = 0
+            parts.pop(idx)
+            parts.pop(idx)
+    content = ' '.join(parts)
 
     time_pattern = r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})'
     match = re.search(time_pattern, content)
     if not match:
         await update.message.reply_text(
             "未找到有效时间，请使用格式：YYYY-MM-DD HH:MM\n"
-            "示例：/cj 8月活动 商品1,商品2 10 2026-08-01 20:00 -c @channel"
+            "示例：/cj 8月活动 商品1,商品2 10 2026-08-01 20:00 -c @channel -f 80"
         )
         return
     draw_time_str = match.group(1)
@@ -623,12 +650,10 @@ async def cmd_create_lottery(update, ctx):
         await update.message.reply_text("消耗学分必须是正数。")
         return
     title = parts[0]
-    # 奖品为从第2个到倒数第2个的所有词（即去掉标题和最后一个消耗学分）
     if len(parts) > 2:
         prize_raw = ' '.join(parts[1:-1])
     else:
         prize_raw = "未命名奖品"
-    # 保留原始分隔符（逗号），以便后续识别多个奖品
     prize = prize_raw
 
     if channel_id:
@@ -660,17 +685,18 @@ async def cmd_create_lottery(update, ctx):
     with db_connect() as conn:
         c = conn.cursor()
         c.execute(
-            "INSERT INTO lotteries (title, prize, cost, draw_time, status, created_by, channel_id) VALUES (?, ?, ?, ?, 0, ?, ?)",
-            (title, prize, cost, draw_time, update.effective_user.id, channel_id)
+            "INSERT INTO lotteries (title, prize, cost, draw_time, status, created_by, channel_id, need_msgs, msg_count) VALUES (?, ?, ?, ?, 0, ?, ?, ?, 0)",
+            (title, prize, cost, draw_time, update.effective_user.id, channel_id, need_msgs)
         )
         lid = c.lastrowid
         conn.commit()
 
-    # 显示奖品时美化
     display_prize = prize.replace(',', '、').replace('，', '、')
     msg = f"✅ 抽奖已创建！ID: {lid}\n标题：{title}\n奖品：{display_prize}\n消耗：{cost} 学分\n开奖时间：{draw_time.strftime('%Y-%m-%d %H:%M')}\n"
     if channel_id:
         msg += f"📢 参与条件：需关注频道 {channel_id}\n"
+    if need_msgs > 0:
+        msg += f"💬 需群内发言数 ≥ {need_msgs} 条（自创建起统计）\n"
     msg += f"⏰ 当前服务器时间：{now_cn().strftime('%Y-%m-%d %H:%M')}"
     await update.message.reply_text(msg)
 
@@ -682,7 +708,7 @@ async def cmd_list_lotteries(update, ctx):
         return
     with db_connect() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, title, prize, cost, draw_time, status, winner_id, channel_id FROM lotteries ORDER BY id DESC")
+        c.execute("SELECT id, title, prize, cost, draw_time, status, winner_id, channel_id, need_msgs, msg_count FROM lotteries ORDER BY id DESC")
         rows = c.fetchall()
     if not rows:
         await update.message.reply_text("暂无抽奖记录。")
@@ -690,12 +716,14 @@ async def cmd_list_lotteries(update, ctx):
     status_map = {0: "⏳ 未开始", 1: "🔚 已结束", 2: "🏆 已开奖"}
     text = "📋 抽奖列表：\n"
     for row in rows:
-        lid, title, prize, cost, dt, status, winner, channel = row
+        lid, title, prize, cost, dt, status, winner, channel, need_msgs, msg_count = row
         status_str = status_map.get(status, "未知")
         display_prize = prize.replace(',', '、').replace('，', '、')
         text += f"ID:{lid} | {title} | {display_prize} | 消耗{cost} | {dt} | {status_str}"
         if channel:
             text += f" | 频道:{channel}"
+        if need_msgs > 0:
+            text += f" | 需发言≥{need_msgs} (当前{msg_count})"
         if winner:
             with db_connect() as conn2:
                 c2 = conn2.cursor()
@@ -706,9 +734,8 @@ async def cmd_list_lotteries(update, ctx):
         text += "\n"
     await update.message.reply_text(text)
 
-# ========== 修改：/qx 改为取消抽奖 ==========
+# ========== /qx 取消抽奖 ==========
 async def cmd_cancel_lottery(update, ctx):
-    """取消抽奖：/qx <抽奖ID>，将状态设为已结束，不选获奖者"""
     if update.effective_chat.type != 'private':
         return
     if update.effective_user.id not in ADMIN_IDS:
@@ -739,9 +766,8 @@ async def cmd_cancel_lottery(update, ctx):
         conn.commit()
     await update.message.reply_text(f"✅ 抽奖「{title}」（ID:{lid}）已取消，不产生获奖者。")
 
-# ========== 新增：/gg 修改开奖时间 ==========
+# ========== /gg 修改开奖时间 ==========
 async def cmd_change_time(update, ctx):
-    """修改开奖时间：/gg <抽奖ID> <新时间 YYYY-MM-DD HH:MM>"""
     if update.effective_chat.type != 'private':
         return
     if update.effective_user.id not in ADMIN_IDS:
@@ -784,9 +810,8 @@ async def cmd_change_time(update, ctx):
         f"旧时间：{old_time}\n新时间：{new_dt.strftime('%Y-%m-%d %H:%M')}"
     )
 
-# ========== 新增：/QL 清理抽奖数据（重置） ==========
+# ========== /QL 清理抽奖数据 ==========
 async def cmd_clean_lottery(update, ctx):
-    """重置抽奖：/QL <抽奖ID>，清空参与者和获奖者，状态重置为0"""
     if update.effective_chat.type != 'private':
         return
     if update.effective_user.id not in ADMIN_IDS:
@@ -810,23 +835,27 @@ async def cmd_clean_lottery(update, ctx):
             await update.message.reply_text("抽奖不存在。")
             return
         lid, title, status = row
-        # 如果已开奖（status=2），也允许重置，清空winner
         c.execute("DELETE FROM lottery_participants WHERE lottery_id=?", (lid,))
-        c.execute("UPDATE lotteries SET status=0, winner_id=NULL WHERE id=?", (lid,))
+        c.execute("UPDATE lotteries SET status=0, winner_id=NULL, msg_count=0 WHERE id=?", (lid,))
         conn.commit()
-    await update.message.reply_text(f"✅ 抽奖「{title}」（ID:{lid}）已重置：参与者和获奖者已清空，状态恢复为未开始。")
+    await update.message.reply_text(f"✅ 抽奖「{title}」（ID:{lid}）已重置：参与者、获奖者、发言统计已清空，状态恢复为未开始。")
 
 # ========== 抽奖核心开奖函数（支持多奖品） ==========
 async def do_draw(lottery_id, bot, force=False):
     with db_connect() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, title, prize, cost, status, draw_time, channel_id FROM lotteries WHERE id=?", (lottery_id,))
+        c.execute("SELECT id, title, prize, cost, status, draw_time, channel_id, need_msgs, msg_count FROM lotteries WHERE id=?", (lottery_id,))
         row = c.fetchone()
         if not row:
             return False, "抽奖不存在"
-        lid, title, prize, cost, status, draw_time, channel = row
+        lid, title, prize, cost, status, draw_time, channel, need_msgs, msg_count = row
         if status != 0:
             return False, "该抽奖已结束或已开奖"
+
+        # 发言数检查（若设置了 need_msgs）
+        if need_msgs > 0 and msg_count < need_msgs:
+            return False, f"发言数未达标 ({msg_count}/{need_msgs})，暂不开奖。"
+
         c.execute("SELECT user_id FROM lottery_participants WHERE lottery_id=?", (lid,))
         participants = [r[0] for r in c.fetchall()]
         if not participants:
@@ -837,25 +866,20 @@ async def do_draw(lottery_id, bot, force=False):
             else:
                 return False, "暂无参与者，未开奖，等待管理员处理。"
 
-        # 拆分奖品列表（支持英文逗号,和中文逗号，）
+        # 拆分奖品列表
         prize_list = [p.strip() for p in re.split(r'[,，]', prize) if p.strip()]
         if not prize_list:
             prize_list = ["未命名奖品"]
 
-        # 参与者打乱
         shuffled = participants.copy()
         random.shuffle(shuffled)
-        # 中奖者数量 = min(奖品数量, 参与者数量)
         winner_count = min(len(prize_list), len(shuffled))
-        winners = shuffled[:winner_count]  # 取前N个
+        winners = shuffled[:winner_count]
 
-        # 更新数据库：存储第一个获奖者（兼容），但我们可以存储所有获奖者到一个字段？目前只存了 winner_id（单个），无法存储多个。
-        # 为了兼容，我们只将第一个获奖者存入 winner_id，并在开奖消息中公布所有获奖者。
         first_winner = winners[0] if winners else None
         c.execute("UPDATE lotteries SET status=2, winner_id=? WHERE id=?", (first_winner, lid))
         conn.commit()
 
-        # 获取所有获奖者昵称
         winner_names = []
         for uid in winners:
             c2 = conn.cursor()
@@ -863,9 +887,7 @@ async def do_draw(lottery_id, bot, force=False):
             wrow = c2.fetchone()
             winner_names.append(wrow[0] if wrow else str(uid))
 
-        # 构造开奖消息
         msg = f"🎉 抽奖开奖结果！\n标题：{title}\n\n"
-        # 分配奖品：每个获奖者对应一个奖品，依次分配
         for i, (prize_name, winner_name) in enumerate(zip(prize_list[:winner_count], winner_names)):
             msg += f"🏆 奖品：{prize_name} → 获奖者：{winner_name}\n"
         if len(prize_list) > winner_count:
@@ -874,7 +896,6 @@ async def do_draw(lottery_id, bot, force=False):
             msg += f"\n🎉 恭喜所有获奖者！"
         else:
             msg += f"\n🎉 恭喜所有获奖者！"
-    # 发送到群组
     for gid in ALLOWED_GROUPS:
         try:
             await bot.send_message(chat_id=gid, text=msg, parse_mode=ParseMode.HTML)
@@ -925,11 +946,11 @@ async def cmd_start(update, ctx):
                 "/shop - 打开商城\n"
                 "/start - 显示本帮助\n"
                 "\n🎰 抽奖管理（私聊）：\n"
-                "/cj <标题> <奖品1,奖品2,...> <消耗学分> <开奖时间> [-c @channel] - 创建多奖品抽奖\n"
+                "/cj <标题> <奖品1,奖品2,...> <消耗学分> <开奖时间> [-c @channel] [-f 发言数] - 创建抽奖\n"
                 "/cjlist - 查看所有抽奖\n"
-                "/qx <抽奖ID> - 取消抽奖（不生成获奖者）\n"
+                "/qx <抽奖ID> - 取消抽奖\n"
                 "/gg <抽奖ID> <新时间> - 修改开奖时间\n"
-                "/QL <抽奖ID> - 重置抽奖（清空参与者和获奖者，恢复未开始）"
+                "/QL <抽奖ID> - 重置抽奖（清空参与者和获奖者）"
             )
             await update.message.reply_text(help_text)
         else:
@@ -1015,17 +1036,54 @@ async def on_msg(update, ctx):
         await update.message.reply_text(msg)
         return
 
+    # ========== 查看近2天开奖记录 ==========
+    if text == "开奖":
+        now = now_cn()
+        two_days_ago = now - timedelta(days=2)
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT id, title, prize, draw_time, winner_id
+                FROM lotteries
+                WHERE status = 2 AND draw_time >= ?
+                ORDER BY draw_time DESC
+                LIMIT 20
+            """, (two_days_ago,))
+            rows = c.fetchall()
+        if not rows:
+            await update.message.reply_text("📭 近2天内暂无开奖记录。")
+            return
+        msg = "📋 近2天开奖记录：\n\n"
+        for idx, (lid, title, prize, draw_time, winner_id) in enumerate(rows, 1):
+            display_prize = prize.replace(',', '、').replace('，', '、')
+            winner_name = "未记录"
+            if winner_id:
+                with db_connect() as conn2:
+                    c2 = conn2.cursor()
+                    c2.execute("SELECT nickname FROM users WHERE user_id=?", (winner_id,))
+                    wrow = c2.fetchone()
+                    if wrow:
+                        winner_name = wrow[0]
+                    else:
+                        winner_name = f"用户{winner_id}"
+            msg += f"{idx}. 🎯 标题：{title}\n"
+            msg += f"   🎁 奖品：{display_prize}\n"
+            msg += f"   🕒 开奖时间：{draw_time}\n"
+            msg += f"   🏆 获奖者：{winner_name}\n\n"
+        await update.message.reply_text(msg)
+        return
+
     # ========== 抽奖参与 ==========
     if text == "抽奖":
         with db_connect() as conn:
             c = conn.cursor()
-            c.execute("SELECT id, title, prize, cost, draw_time, channel_id FROM lotteries WHERE status=0 ORDER BY draw_time ASC")
+            c.execute("SELECT id, title, prize, cost, draw_time, channel_id, need_msgs FROM lotteries WHERE status=0 ORDER BY draw_time ASC")
             rows = c.fetchall()
         if not rows:
             await update.message.reply_text("当前没有任何抽奖活动，请关注后续通知。")
             return
 
-        for lid, title, prize, cost, draw_time, channel_id in rows:
+        for lid, title, prize, cost, draw_time, channel_id, need_msgs in rows:
             if isinstance(draw_time, str):
                 draw_time = datetime.fromisoformat(draw_time)
             expired = now_cn() > draw_time
@@ -1047,6 +1105,13 @@ async def on_msg(update, ctx):
             msg = f"🎰 当前抽奖活动\n标题：{title}\n奖品：{display_prize}\n消耗：{cost} 学分\n开奖时间：{draw_time}\n"
             if channel_id:
                 msg += f"📢 参与条件：需关注频道 {channel_id}\n"
+            if need_msgs > 0:
+                # 获取当前发言统计
+                with db_connect() as conn3:
+                    c3 = conn3.cursor()
+                    c3.execute("SELECT msg_count FROM lotteries WHERE id=?", (lid,))
+                    cnt = c3.fetchone()[0]
+                msg += f"💬 需群内发言数 ≥ {need_msgs} 条（当前 {cnt} 条）\n"
             if names:
                 msg += f"👥 已参与（{len(names)}人）：{', '.join(names)}\n"
             else:
@@ -1060,6 +1125,30 @@ async def on_msg(update, ctx):
 
     if text.startswith('/'):
         return
+
+    # ===== 发言统计（用于抽奖发言数门槛） =====
+    # 仅当消息来自允许的群组，且不是命令，且长度≥4（符合掉落条件）才统计
+    # 但为了准确，我们只统计所有有效消息（跳过机器人自己）
+    # 注意：这里我们只对设置了 need_msgs > 0 且未开奖的抽奖进行累计
+    # 由于一个群组可能同时存在多个抽奖，我们为每个抽奖独立统计
+    with db_connect() as conn:
+        c = conn.cursor()
+        now = now_cn()
+        # 查询所有未开奖且 need_msgs > 0 的抽奖
+        c.execute("SELECT id, created_at FROM lotteries WHERE status=0 AND need_msgs > 0")
+        rows = c.fetchall()
+    for lid, created_at in rows:
+        # 只统计抽奖创建之后的消息
+        try:
+            created_dt = datetime.fromisoformat(created_at) if isinstance(created_at, str) else created_at
+        except:
+            continue
+        if now >= created_dt:  # 创建之后
+            # 为该抽奖增加发言计数
+            with db_connect() as conn2:
+                c2 = conn2.cursor()
+                c2.execute("UPDATE lotteries SET msg_count = msg_count + 1 WHERE id=? AND status=0", (lid,))
+                conn2.commit()
 
     # ===== 骰子下注 =====
     dice_match = re.match(r'^押\s+(\S+)\s+(\d+(?:\.\d+)?)$', text) or re.match(r'^押\s+(\d+(?:\.\d+)?)\s+(\S+)$', text)
@@ -1320,7 +1409,7 @@ def main():
     app.add_handler(CommandHandler("cjlist", cmd_list_lotteries))
     app.add_handler(CommandHandler("qx", cmd_cancel_lottery))
     app.add_handler(CommandHandler("gg", cmd_change_time))
-    app.add_handler(CommandHandler("ql", cmd_clean_lottery))   # 新增 /QL
+    app.add_handler(CommandHandler("ql", cmd_clean_lottery))
     app.run_polling(allowed_updates=["message", "callback_query"])
 
 if __name__ == "__main__":
