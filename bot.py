@@ -102,7 +102,6 @@ def init_db():
                 msg_count INTEGER DEFAULT 0
             )
         """)
-        # 如果表已存在但缺少新列，则添加
         c.execute("PRAGMA table_info(lotteries)")
         existing_cols = [col[1] for col in c.fetchall()]
         if "channel_id" not in existing_cols:
@@ -341,17 +340,17 @@ async def cb(update, ctx):
                 reply_markup=Markup([[Btn("🔙 返回钱包", callback_data="back")]])
             )
 
-    # ---------- 抽奖参与回调 ----------
+    # ---------- 抽奖参与回调（增加发言数检查） ----------
     elif data.startswith("lottery_join_"):
         lottery_id = int(data.split("_")[2])
         with db_connect() as conn:
             c = conn.cursor()
-            c.execute("SELECT title, prize, cost, status, draw_time, channel_id, need_msgs FROM lotteries WHERE id=?", (lottery_id,))
+            c.execute("SELECT title, prize, cost, status, draw_time, channel_id, need_msgs, msg_count FROM lotteries WHERE id=?", (lottery_id,))
             row = c.fetchone()
             if not row:
                 await query.answer("❌ 抽奖不存在", show_alert=True)
                 return
-            title, prize, cost, status, draw_time, channel_id, need_msgs = row
+            title, prize, cost, status, draw_time, channel_id, need_msgs, msg_count = row
             if isinstance(draw_time, str):
                 draw_time = datetime.fromisoformat(draw_time)
             if status != 0:
@@ -359,6 +358,11 @@ async def cb(update, ctx):
                 return
             if now_cn() > draw_time:
                 await query.answer("❌ 该抽奖已过开奖时间", show_alert=True)
+                return
+
+            # ---- 新增：发言数检查 ----
+            if need_msgs > 0 and msg_count < need_msgs:
+                await query.answer(f"❌ 发言数不足，当前 {msg_count} 条，需要 {need_msgs} 条", show_alert=True)
                 return
 
             # 检查是否已参与
@@ -435,7 +439,7 @@ async def cb(update, ctx):
         if channel_id:
             msg_text += f"📢 参与条件：需关注频道 {channel_id}\n"
         if need_msgs > 0:
-            msg_text += f"💬 需群内发言数 ≥ {need_msgs} 条（已统计中）\n"
+            msg_text += f"💬 需群内发言数 ≥ {need_msgs} 条（当前 {msg_count} 条）\n"
         if names:
             msg_text += f"👥 已参与（{len(names)}人）：{', '.join(names)}\n"
         else:
@@ -852,7 +856,7 @@ async def do_draw(lottery_id, bot, force=False):
         if status != 0:
             return False, "该抽奖已结束或已开奖"
 
-        # 发言数检查（若设置了 need_msgs）
+        # 开奖前再次检查发言数（但参与时已限制，此检查保留双重保险）
         if need_msgs > 0 and msg_count < need_msgs:
             return False, f"发言数未达标 ({msg_count}/{need_msgs})，暂不开奖。"
 
@@ -1073,17 +1077,17 @@ async def on_msg(update, ctx):
         await update.message.reply_text(msg)
         return
 
-    # ========== 抽奖参与 ==========
+    # ========== 抽奖参与显示（增加发言数展示） ==========
     if text == "抽奖":
         with db_connect() as conn:
             c = conn.cursor()
-            c.execute("SELECT id, title, prize, cost, draw_time, channel_id, need_msgs FROM lotteries WHERE status=0 ORDER BY draw_time ASC")
+            c.execute("SELECT id, title, prize, cost, draw_time, channel_id, need_msgs, msg_count FROM lotteries WHERE status=0 ORDER BY draw_time ASC")
             rows = c.fetchall()
         if not rows:
             await update.message.reply_text("当前没有任何抽奖活动，请关注后续通知。")
             return
 
-        for lid, title, prize, cost, draw_time, channel_id, need_msgs in rows:
+        for lid, title, prize, cost, draw_time, channel_id, need_msgs, msg_count in rows:
             if isinstance(draw_time, str):
                 draw_time = datetime.fromisoformat(draw_time)
             expired = now_cn() > draw_time
@@ -1106,12 +1110,7 @@ async def on_msg(update, ctx):
             if channel_id:
                 msg += f"📢 参与条件：需关注频道 {channel_id}\n"
             if need_msgs > 0:
-                # 获取当前发言统计
-                with db_connect() as conn3:
-                    c3 = conn3.cursor()
-                    c3.execute("SELECT msg_count FROM lotteries WHERE id=?", (lid,))
-                    cnt = c3.fetchone()[0]
-                msg += f"💬 需群内发言数 ≥ {need_msgs} 条（当前 {cnt} 条）\n"
+                msg += f"💬 需群内发言数 ≥ {need_msgs} 条（当前 {msg_count} 条）\n"
             if names:
                 msg += f"👥 已参与（{len(names)}人）：{', '.join(names)}\n"
             else:
@@ -1128,9 +1127,6 @@ async def on_msg(update, ctx):
 
     # ===== 发言统计（用于抽奖发言数门槛） =====
     # 仅当消息来自允许的群组，且不是命令，且长度≥4（符合掉落条件）才统计
-    # 但为了准确，我们只统计所有有效消息（跳过机器人自己）
-    # 注意：这里我们只对设置了 need_msgs > 0 且未开奖的抽奖进行累计
-    # 由于一个群组可能同时存在多个抽奖，我们为每个抽奖独立统计
     with db_connect() as conn:
         c = conn.cursor()
         now = now_cn()
@@ -1143,8 +1139,7 @@ async def on_msg(update, ctx):
             created_dt = datetime.fromisoformat(created_at) if isinstance(created_at, str) else created_at
         except:
             continue
-        if now >= created_dt:  # 创建之后
-            # 为该抽奖增加发言计数
+        if now >= created_dt:
             with db_connect() as conn2:
                 c2 = conn2.cursor()
                 c2.execute("UPDATE lotteries SET msg_count = msg_count + 1 WHERE id=? AND status=0", (lid,))
