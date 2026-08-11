@@ -15,8 +15,8 @@ def now_cn():
 
 # ========== 配置 ==========
 TOKEN = "8179579064:AAF57RUAH5TVtrW4qdA4_wIAtWkRAAkqkvo"   # 请替换为你的Token
-ALLOWED_GROUPS = [-1003002241602, -1003745425265, -1003720878201]
-ADMIN_IDS = [8354445328, 877039616, 42438298]
+ALLOWED_GROUPS = [-1003002241602, -1003745425265, -1003720878201]  # 替换为你的群组ID
+ADMIN_IDS = [8354445328, 877039616, 42438298]  # 替换为管理员ID
 
 BASE_DROP_PROB = 0.14
 TRIPLE_MULTIPLIER = 3
@@ -67,7 +67,6 @@ def db_connect():
 def init_db():
     with db_connect() as conn:
         c = conn.cursor()
-        # 已有表保持不变
         c.execute("CREATE TABLE IF NOT EXISTS users (user_id INT PRIMARY KEY, nickname TEXT, coins REAL)")
         c.execute("CREATE TABLE IF NOT EXISTS daily (user_id INT, date TEXT, gain REAL, PRIMARY KEY(user_id, date))")
         c.execute("CREATE TABLE IF NOT EXISTS tx (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INT, type TEXT, amount REAL, desc TEXT, ts TIMESTAMP)")
@@ -85,7 +84,6 @@ def init_db():
             c.execute("ALTER TABLE global_limits ADD COLUMN remaining INT DEFAULT 0")
         c.execute("INSERT OR IGNORE INTO global_limits (item_id, remaining) VALUES (3, 1)")
 
-        # ----- 抽奖表，增加 need_msgs 和 msg_count -----
         c.execute("""
             CREATE TABLE IF NOT EXISTS lotteries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -340,7 +338,7 @@ async def cb(update, ctx):
                 reply_markup=Markup([[Btn("🔙 返回钱包", callback_data="back")]])
             )
 
-    # ---------- 抽奖参与回调（增加发言数检查） ----------
+    # ---------- 抽奖参与回调 ----------
     elif data.startswith("lottery_join_"):
         lottery_id = int(data.split("_")[2])
         with db_connect() as conn:
@@ -360,9 +358,9 @@ async def cb(update, ctx):
                 await query.answer("❌ 该抽奖已过开奖时间", show_alert=True)
                 return
 
-            # ---- 新增：发言数检查 ----
+            # 检查发言数是否达标（新增）
             if need_msgs > 0 and msg_count < need_msgs:
-                await query.answer(f"❌ 发言数不足，当前 {msg_count} 条，需要 {need_msgs} 条", show_alert=True)
+                await query.answer(f"❌ 群内发言数未达标（{msg_count}/{need_msgs}），暂无法参与", show_alert=True)
                 return
 
             # 检查是否已参与
@@ -594,18 +592,15 @@ async def cmd_create_lottery(update, ctx):
     else:
         content = text
 
-    # 解析参数：-c 频道, -f 发言数
     channel_id = None
     need_msgs = 0
     parts = content.split()
-    # 处理 -c
     if '-c' in parts:
         idx = parts.index('-c')
         if idx + 1 < len(parts):
             channel_id = parts[idx + 1]
             parts.pop(idx)
             parts.pop(idx)
-    # 处理 -f
     if '-f' in parts:
         idx = parts.index('-f')
         if idx + 1 < len(parts):
@@ -844,6 +839,68 @@ async def cmd_clean_lottery(update, ctx):
         conn.commit()
     await update.message.reply_text(f"✅ 抽奖「{title}」（ID:{lid}）已重置：参与者、获奖者、发言统计已清空，状态恢复为未开始。")
 
+# ========== /sb 取消用户参与（不退还学分） ==========
+async def cmd_remove_user_lottery(update, ctx):
+    """取消某人在所有进行中抽奖的参与资格（不退还学分）：/sb <用户ID或@用户名>"""
+    if update.effective_chat.type != 'private':
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    args = ctx.args
+    if not args:
+        await update.message.reply_text("用法：/sb <用户ID> 或 /sb @用户名\n例如：/sb 123456789 或 /sb @someone")
+        return
+    user_identifier = args[0]
+    target_uid = None
+    if user_identifier.isdigit():
+        target_uid = int(user_identifier)
+    elif user_identifier.startswith('@'):
+        try:
+            chat = await ctx.bot.get_chat(user_identifier)
+            target_uid = chat.id
+        except Exception:
+            await update.message.reply_text("❌ 无法通过 @用户名 获取用户ID，请直接输入数字ID。")
+            return
+    else:
+        await update.message.reply_text("❌ 请输入有效的用户ID（数字）或 @用户名。")
+        return
+
+    # 查询该用户在所有未开奖抽奖中的参与记录
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT l.id, l.title
+            FROM lottery_participants lp
+            JOIN lotteries l ON lp.lottery_id = l.id
+            WHERE lp.user_id = ? AND l.status = 0
+        """, (target_uid,))
+        rows = c.fetchall()
+        if not rows:
+            await update.message.reply_text(f"用户 {target_uid} 没有参与任何进行中的抽奖。")
+            return
+
+        # 删除参与记录（不退还学分）
+        titles = []
+        for lid, title in rows:
+            c.execute("DELETE FROM lottery_participants WHERE lottery_id=? AND user_id=?", (lid, target_uid))
+            titles.append(title)
+        conn.commit()
+
+    # 获取用户昵称用于显示
+    user_name = str(target_uid)
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT nickname FROM users WHERE user_id=?", (target_uid,))
+        row = c.fetchone()
+        if row:
+            user_name = row[0]
+
+    await update.message.reply_text(
+        f"✅ 已取消用户 {user_name}（ID:{target_uid}）在以下抽奖中的参与资格（不退还学分）：\n"
+        f"{', '.join(titles)}"
+    )
+
 # ========== 抽奖核心开奖函数（支持多奖品） ==========
 async def do_draw(lottery_id, bot, force=False):
     with db_connect() as conn:
@@ -856,7 +913,6 @@ async def do_draw(lottery_id, bot, force=False):
         if status != 0:
             return False, "该抽奖已结束或已开奖"
 
-        # 开奖前再次检查发言数（但参与时已限制，此检查保留双重保险）
         if need_msgs > 0 and msg_count < need_msgs:
             return False, f"发言数未达标 ({msg_count}/{need_msgs})，暂不开奖。"
 
@@ -870,7 +926,6 @@ async def do_draw(lottery_id, bot, force=False):
             else:
                 return False, "暂无参与者，未开奖，等待管理员处理。"
 
-        # 拆分奖品列表
         prize_list = [p.strip() for p in re.split(r'[,，]', prize) if p.strip()]
         if not prize_list:
             prize_list = ["未命名奖品"]
@@ -954,7 +1009,8 @@ async def cmd_start(update, ctx):
                 "/cjlist - 查看所有抽奖\n"
                 "/qx <抽奖ID> - 取消抽奖\n"
                 "/gg <抽奖ID> <新时间> - 修改开奖时间\n"
-                "/QL <抽奖ID> - 重置抽奖（清空参与者和获奖者）"
+                "/QL <抽奖ID> - 重置抽奖（清空参与者和获奖者）\n"
+                "/sb <用户ID/@用户名> - 取消某人在所有进行中抽奖的参与资格（不退还学分）\n"
             )
             await update.message.reply_text(help_text)
         else:
@@ -1077,7 +1133,7 @@ async def on_msg(update, ctx):
         await update.message.reply_text(msg)
         return
 
-    # ========== 抽奖参与显示（增加发言数展示） ==========
+    # ========== 抽奖参与 ==========
     if text == "抽奖":
         with db_connect() as conn:
             c = conn.cursor()
@@ -1126,15 +1182,12 @@ async def on_msg(update, ctx):
         return
 
     # ===== 发言统计（用于抽奖发言数门槛） =====
-    # 仅当消息来自允许的群组，且不是命令，且长度≥4（符合掉落条件）才统计
     with db_connect() as conn:
         c = conn.cursor()
         now = now_cn()
-        # 查询所有未开奖且 need_msgs > 0 的抽奖
         c.execute("SELECT id, created_at FROM lotteries WHERE status=0 AND need_msgs > 0")
         rows = c.fetchall()
     for lid, created_at in rows:
-        # 只统计抽奖创建之后的消息
         try:
             created_dt = datetime.fromisoformat(created_at) if isinstance(created_at, str) else created_at
         except:
@@ -1405,6 +1458,7 @@ def main():
     app.add_handler(CommandHandler("qx", cmd_cancel_lottery))
     app.add_handler(CommandHandler("gg", cmd_change_time))
     app.add_handler(CommandHandler("ql", cmd_clean_lottery))
+    app.add_handler(CommandHandler("sb", cmd_remove_user_lottery))
     app.run_polling(allowed_updates=["message", "callback_query"])
 
 if __name__ == "__main__":
