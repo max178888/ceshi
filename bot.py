@@ -126,6 +126,16 @@ def init_db():
                 PRIMARY KEY (lottery_id, user_id, chat_id)
             )
         """)
+
+        # 新增：每日低保领取记录
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS daily_welfare (
+                user_id INTEGER,
+                date TEXT,
+                count INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, date)
+            )
+        """)
         conn.commit()
 
 # ---------- 用户函数 ----------
@@ -217,6 +227,23 @@ def decrease_remaining(item_id):
         c.execute("UPDATE global_limits SET remaining = remaining - 1 WHERE item_id=? AND remaining > 0", (item_id,))
         conn.commit()
         return c.rowcount > 0
+
+# ---------- 低保函数 ----------
+def get_welfare_today_count(uid):
+    today = now_cn().strftime('%Y-%m-%d')
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT count FROM daily_welfare WHERE user_id=? AND date=?", (uid, today))
+        row = c.fetchone()
+        return row[0] if row else 0
+
+def add_welfare_record(uid):
+    today = now_cn().strftime('%Y-%m-%d')
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO daily_welfare (user_id, date, count) VALUES (?,?,1) ON CONFLICT(user_id,date) DO UPDATE SET count = count + 1",
+                  (uid, today))
+        conn.commit()
 
 # ========== 键盘 ==========
 def wallet_kb():
@@ -1127,6 +1154,32 @@ async def on_msg(update, ctx):
             msg += f"   🕒 开奖时间：{draw_time}\n"
             msg += f"   🏆 获奖者：{winner_name}\n\n"
         await update.message.reply_text(msg)
+        return
+
+    # ========== 低保命令 ==========
+    if text == "低保":
+        uid = update.message.from_user.id
+        name = update.message.from_user.first_name
+        get_user(uid, name)
+        bal = get_coins(uid)
+        if bal >= 5:
+            await update.message.reply_text("您的学分已达到或超过 5 分，无需领取低保。")
+            return
+        # 检查今日领取次数
+        today_count = get_welfare_today_count(uid)
+        if today_count >= 5:
+            await update.message.reply_text("您今天已领取 5 次低保，已达上限，请明天再试。")
+            return
+        # 发放低保
+        add_coins(uid, 5, "每日低保领取")
+        add_welfare_record(uid)
+        new_bal = get_coins(uid)
+        remaining = 5 - (today_count + 1)
+        await update.message.reply_text(
+            f"✅ 低保发放成功！\n"
+            f"您当前余额：{new_bal:.2f} 学分\n"
+            f"今日剩余领取次数：{remaining} 次"
+        )
         return
 
     # ========== 抽奖参与 ==========
