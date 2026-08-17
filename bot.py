@@ -358,7 +358,7 @@ async def cb(update, ctx):
                 await query.answer("❌ 该抽奖已过开奖时间", show_alert=True)
                 return
 
-            # 检查发言数是否达标（新增）
+            # 检查发言数是否达标
             if need_msgs > 0 and msg_count < need_msgs:
                 await query.answer(f"❌ 群内发言数未达标（{msg_count}/{need_msgs}），暂无法参与", show_alert=True)
                 return
@@ -841,7 +841,6 @@ async def cmd_clean_lottery(update, ctx):
 
 # ========== /sb 取消用户参与（不退还学分） ==========
 async def cmd_remove_user_lottery(update, ctx):
-    """取消某人在所有进行中抽奖的参与资格（不退还学分）：/sb <用户ID或@用户名>"""
     if update.effective_chat.type != 'private':
         return
     if update.effective_user.id not in ADMIN_IDS:
@@ -866,7 +865,6 @@ async def cmd_remove_user_lottery(update, ctx):
         await update.message.reply_text("❌ 请输入有效的用户ID（数字）或 @用户名。")
         return
 
-    # 查询该用户在所有未开奖抽奖中的参与记录
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("""
@@ -880,14 +878,12 @@ async def cmd_remove_user_lottery(update, ctx):
             await update.message.reply_text(f"用户 {target_uid} 没有参与任何进行中的抽奖。")
             return
 
-        # 删除参与记录（不退还学分）
         titles = []
         for lid, title in rows:
             c.execute("DELETE FROM lottery_participants WHERE lottery_id=? AND user_id=?", (lid, target_uid))
             titles.append(title)
         conn.commit()
 
-    # 获取用户昵称用于显示
     user_name = str(target_uid)
     with db_connect() as conn:
         c = conn.cursor()
@@ -1214,6 +1210,11 @@ async def on_msg(update, ctx):
         if amount <= 0:
             await update.message.reply_text("下注金额必须为正数。")
             return
+        # 押注上限 100 学分
+        if amount > 100:
+            await update.message.reply_text("押注金额不能超过 100 学分。")
+            return
+
         state = get_dice_state()
         if state['status'] != 'active':
             rid = create_new_round()
@@ -1223,6 +1224,7 @@ async def on_msg(update, ctx):
             if state['status'] != 'active':
                 await update.message.reply_text("游戏初始化失败，请稍后再试。")
                 return
+
         uid = update.message.from_user.id
         name = update.message.from_user.first_name
         get_user(uid, name)
@@ -1233,12 +1235,22 @@ async def on_msg(update, ctx):
         if not sub_coins(uid, amount, f"骰子下注 {bet_type}"):
             await update.message.reply_text("下注失败，请稍后再试。")
             return
+
         round_id = state['round_id']
+        # 检查是否已经押注过
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT 1 FROM dice_bets WHERE round_id=? AND user_id=?", (round_id, uid))
+            if c.fetchone():
+                await update.message.reply_text("您在本期骰子中已经下注过了，不能重复下注。")
+                return
+        # 插入新押注
         with db_connect() as conn:
             c = conn.cursor()
             c.execute("INSERT INTO dice_bets (round_id, user_id, amount, bet_type, win) VALUES (?,?,?,?,?)",
                       (round_id, uid, amount, bet_type, None))
             conn.commit()
+
         end_time = datetime.fromisoformat(state['end_time'])
         remaining_seconds = max(0, int((end_time - now_cn()).total_seconds()))
         date_str = now_cn().strftime('%m月%d日')
@@ -1275,7 +1287,7 @@ async def on_msg(update, ctx):
         )
 
 # ========== 骰子游戏核心 ==========
-DICE_INTERVAL = 120
+DICE_INTERVAL = 180   # 修改为180秒
 RAKE = 0.10
 
 def get_dice_state():
@@ -1406,7 +1418,9 @@ async def settle_round(context, rid, chat_id):
                 c.execute("SELECT nickname FROM users WHERE user_id=?", (uid,))
                 row = c.fetchone()
                 name = row[0] if row else str(uid)
-            result_msg += f"  {name} 押{bet_type}{amount}学分 → +{win:.2f}学分\n"
+            # 使用超链接
+            link = f'<a href="tg://user?id={uid}">{name}</a>'
+            result_msg += f"  {link} 押{bet_type}{amount}学分 → +{win:.2f}学分\n"
     else:
         result_msg += "😭本期无人中奖\n"
     result_msg += "\n⏰下一期即将开始，请下注"
