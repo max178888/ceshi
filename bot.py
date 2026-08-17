@@ -97,7 +97,8 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 channel_id TEXT,
                 need_msgs INTEGER DEFAULT 0,
-                msg_count INTEGER DEFAULT 0
+                msg_count INTEGER DEFAULT 0,
+                winners TEXT DEFAULT NULL
             )
         """)
         c.execute("PRAGMA table_info(lotteries)")
@@ -108,6 +109,8 @@ def init_db():
             c.execute("ALTER TABLE lotteries ADD COLUMN need_msgs INTEGER DEFAULT 0")
         if "msg_count" not in existing_cols:
             c.execute("ALTER TABLE lotteries ADD COLUMN msg_count INTEGER DEFAULT 0")
+        if "winners" not in existing_cols:
+            c.execute("ALTER TABLE lotteries ADD COLUMN winners TEXT DEFAULT NULL")
 
         c.execute("""
             CREATE TABLE IF NOT EXISTS lottery_participants (
@@ -127,7 +130,6 @@ def init_db():
             )
         """)
 
-        # 新增：每日低保领取记录
         c.execute("""
             CREATE TABLE IF NOT EXISTS daily_welfare (
                 user_id INTEGER,
@@ -385,18 +387,15 @@ async def cb(update, ctx):
                 await query.answer("❌ 该抽奖已过开奖时间", show_alert=True)
                 return
 
-            # 检查发言数是否达标
             if need_msgs > 0 and msg_count < need_msgs:
                 await query.answer(f"❌ 群内发言数未达标（{msg_count}/{need_msgs}），暂无法参与", show_alert=True)
                 return
 
-            # 检查是否已参与
             c.execute("SELECT 1 FROM lottery_participants WHERE lottery_id=? AND user_id=?", (lottery_id, uid))
             if c.fetchone():
                 await query.answer("您已参与过本次抽奖", show_alert=True)
                 return
 
-            # 频道关注校验
             if channel_id:
                 try:
                     member = await ctx.bot.get_chat_member(chat_id=channel_id, user_id=uid)
@@ -734,7 +733,7 @@ async def cmd_list_lotteries(update, ctx):
         return
     with db_connect() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, title, prize, cost, draw_time, status, winner_id, channel_id, need_msgs, msg_count FROM lotteries ORDER BY id DESC")
+        c.execute("SELECT id, title, prize, cost, draw_time, status, winner_id, channel_id, need_msgs, msg_count, winners FROM lotteries ORDER BY id DESC")
         rows = c.fetchall()
     if not rows:
         await update.message.reply_text("暂无抽奖记录。")
@@ -742,7 +741,7 @@ async def cmd_list_lotteries(update, ctx):
     status_map = {0: "⏳ 未开始", 1: "🔚 已结束", 2: "🏆 已开奖"}
     text = "📋 抽奖列表：\n"
     for row in rows:
-        lid, title, prize, cost, dt, status, winner, channel, need_msgs, msg_count = row
+        lid, title, prize, cost, dt, status, winner, channel, need_msgs, msg_count, winners = row
         status_str = status_map.get(status, "未知")
         display_prize = prize.replace(',', '、').replace('，', '、')
         text += f"ID:{lid} | {title} | {display_prize} | 消耗{cost} | {dt} | {status_str}"
@@ -750,7 +749,18 @@ async def cmd_list_lotteries(update, ctx):
             text += f" | 频道:{channel}"
         if need_msgs > 0:
             text += f" | 需发言≥{need_msgs} (当前{msg_count})"
-        if winner:
+        # 显示获奖者（多个）
+        if winners:
+            winner_ids = [int(x) for x in winners.split(',') if x.strip().isdigit()]
+            names = []
+            for wid in winner_ids:
+                with db_connect() as conn2:
+                    c2 = conn2.cursor()
+                    c2.execute("SELECT nickname FROM users WHERE user_id=?", (wid,))
+                    w = c2.fetchone()
+                    names.append(w[0] if w else str(wid))
+            text += f" | 获奖者：{', '.join(names)}"
+        elif winner:
             with db_connect() as conn2:
                 c2 = conn2.cursor()
                 c2.execute("SELECT nickname FROM users WHERE user_id=?", (winner,))
@@ -862,7 +872,7 @@ async def cmd_clean_lottery(update, ctx):
             return
         lid, title, status = row
         c.execute("DELETE FROM lottery_participants WHERE lottery_id=?", (lid,))
-        c.execute("UPDATE lotteries SET status=0, winner_id=NULL, msg_count=0 WHERE id=?", (lid,))
+        c.execute("UPDATE lotteries SET status=0, winner_id=NULL, winners=NULL, msg_count=0 WHERE id=?", (lid,))
         conn.commit()
     await update.message.reply_text(f"✅ 抽奖「{title}」（ID:{lid}）已重置：参与者、获奖者、发言统计已清空，状态恢复为未开始。")
 
@@ -924,7 +934,7 @@ async def cmd_remove_user_lottery(update, ctx):
         f"{', '.join(titles)}"
     )
 
-# ========== 抽奖核心开奖函数（支持多奖品） ==========
+# ========== 抽奖核心开奖函数（支持多奖品，存储所有获奖者） ==========
 async def do_draw(lottery_id, bot, force=False):
     with db_connect() as conn:
         c = conn.cursor()
@@ -959,19 +969,23 @@ async def do_draw(lottery_id, bot, force=False):
         winners = shuffled[:winner_count]
 
         first_winner = winners[0] if winners else None
-        c.execute("UPDATE lotteries SET status=2, winner_id=? WHERE id=?", (first_winner, lid))
+        # 存储所有获奖者ID（逗号分隔）
+        winners_str = ','.join(str(uid) for uid in winners) if winners else ''
+        c.execute("UPDATE lotteries SET status=2, winner_id=?, winners=? WHERE id=?", (first_winner, winners_str, lid))
         conn.commit()
 
-        winner_names = []
+        # 获取获奖者昵称（用于显示）
+        winner_links = []
         for uid in winners:
             c2 = conn.cursor()
             c2.execute("SELECT nickname FROM users WHERE user_id=?", (uid,))
             wrow = c2.fetchone()
-            winner_names.append(wrow[0] if wrow else str(uid))
+            name = wrow[0] if wrow else str(uid)
+            winner_links.append(f'<a href="tg://user?id={uid}">{name}</a>')
 
         msg = f"🎉 抽奖开奖结果！\n标题：{title}\n\n"
-        for i, (prize_name, winner_name) in enumerate(zip(prize_list[:winner_count], winner_names)):
-            msg += f"🏆 奖品：{prize_name} → 获奖者：{winner_name}\n"
+        for i, (prize_name, link) in enumerate(zip(prize_list[:winner_count], winner_links)):
+            msg += f"🏆 奖品：{prize_name} → 获奖者：{link}\n"
         if len(prize_list) > winner_count:
             msg += f"\n⚠️ 参与者数量不足，剩余 {len(prize_list)-winner_count} 个奖品无人获得。"
         elif len(participants) > len(prize_list):
@@ -1119,14 +1133,14 @@ async def on_msg(update, ctx):
         await update.message.reply_text(msg)
         return
 
-    # ========== 查看近2天开奖记录 ==========
+    # ========== 查看近2天开奖记录（支持多个获奖者） ==========
     if text == "开奖":
         now = now_cn()
         two_days_ago = now - timedelta(days=2)
         with db_connect() as conn:
             c = conn.cursor()
             c.execute("""
-                SELECT id, title, prize, draw_time, winner_id
+                SELECT id, title, prize, draw_time, winners
                 FROM lotteries
                 WHERE status = 2 AND draw_time >= ?
                 ORDER BY draw_time DESC
@@ -1137,23 +1151,26 @@ async def on_msg(update, ctx):
             await update.message.reply_text("📭 近2天内暂无开奖记录。")
             return
         msg = "📋 近2天开奖记录：\n\n"
-        for idx, (lid, title, prize, draw_time, winner_id) in enumerate(rows, 1):
+        for idx, (lid, title, prize, draw_time, winners_str) in enumerate(rows, 1):
             display_prize = prize.replace(',', '、').replace('，', '、')
-            winner_name = "未记录"
-            if winner_id:
-                with db_connect() as conn2:
-                    c2 = conn2.cursor()
-                    c2.execute("SELECT nickname FROM users WHERE user_id=?", (winner_id,))
-                    wrow = c2.fetchone()
-                    if wrow:
-                        winner_name = wrow[0]
-                    else:
-                        winner_name = f"用户{winner_id}"
+            # 解析获奖者
+            winner_links = []
+            if winners_str:
+                winner_ids = [int(x) for x in winners_str.split(',') if x.strip().isdigit()]
+                for wid in winner_ids:
+                    with db_connect() as conn2:
+                        c2 = conn2.cursor()
+                        c2.execute("SELECT nickname FROM users WHERE user_id=?", (wid,))
+                        wrow = c2.fetchone()
+                        name = wrow[0] if wrow else str(wid)
+                        winner_links.append(f'<a href="tg://user?id={wid}">{name}</a>')
+            if not winner_links:
+                winner_links = ["未记录"]
             msg += f"{idx}. 🎯 标题：{title}\n"
             msg += f"   🎁 奖品：{display_prize}\n"
             msg += f"   🕒 开奖时间：{draw_time}\n"
-            msg += f"   🏆 获奖者：{winner_name}\n\n"
-        await update.message.reply_text(msg)
+            msg += f"   🏆 获奖者：{', '.join(winner_links)}\n\n"
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
         return
 
     # ========== 低保命令 ==========
@@ -1165,12 +1182,10 @@ async def on_msg(update, ctx):
         if bal >= 5:
             await update.message.reply_text("您的学分已达到或超过 5 分，无需领取低保。")
             return
-        # 检查今日领取次数
         today_count = get_welfare_today_count(uid)
         if today_count >= 5:
             await update.message.reply_text("您今天已领取 5 次低保，已达上限，请明天再试。")
             return
-        # 发放低保
         add_coins(uid, 5, "每日低保领取")
         add_welfare_record(uid)
         new_bal = get_coins(uid)
@@ -1230,7 +1245,7 @@ async def on_msg(update, ctx):
     if text.startswith('/'):
         return
 
-    # ===== 发言统计（用于抽奖发言数门槛） =====
+    # ===== 发言统计 =====
     with db_connect() as conn:
         c = conn.cursor()
         now = now_cn()
@@ -1263,7 +1278,6 @@ async def on_msg(update, ctx):
         if amount <= 0:
             await update.message.reply_text("下注金额必须为正数。")
             return
-        # 押注上限 100 学分
         if amount > 100:
             await update.message.reply_text("押注金额不能超过 100 学分。")
             return
@@ -1290,14 +1304,12 @@ async def on_msg(update, ctx):
             return
 
         round_id = state['round_id']
-        # 检查是否已经押注过
         with db_connect() as conn:
             c = conn.cursor()
             c.execute("SELECT 1 FROM dice_bets WHERE round_id=? AND user_id=?", (round_id, uid))
             if c.fetchone():
                 await update.message.reply_text("您在本期骰子中已经下注过了，不能重复下注。")
                 return
-        # 插入新押注
         with db_connect() as conn:
             c = conn.cursor()
             c.execute("INSERT INTO dice_bets (round_id, user_id, amount, bet_type, win) VALUES (?,?,?,?,?)",
@@ -1340,7 +1352,7 @@ async def on_msg(update, ctx):
         )
 
 # ========== 骰子游戏核心 ==========
-DICE_INTERVAL = 180   # 修改为180秒
+DICE_INTERVAL = 180
 RAKE = 0.10
 
 def get_dice_state():
@@ -1471,7 +1483,6 @@ async def settle_round(context, rid, chat_id):
                 c.execute("SELECT nickname FROM users WHERE user_id=?", (uid,))
                 row = c.fetchone()
                 name = row[0] if row else str(uid)
-            # 使用超链接
             link = f'<a href="tg://user?id={uid}">{name}</a>'
             result_msg += f"  {link} 押{bet_type}{amount}学分 → +{win:.2f}学分\n"
     else:
