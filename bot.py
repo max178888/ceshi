@@ -749,7 +749,6 @@ async def cmd_list_lotteries(update, ctx):
             text += f" | 频道:{channel}"
         if need_msgs > 0:
             text += f" | 需发言≥{need_msgs} (当前{msg_count})"
-        # 显示获奖者（多个）
         if winners:
             winner_ids = [int(x) for x in winners.split(',') if x.strip().isdigit()]
             names = []
@@ -802,23 +801,37 @@ async def cmd_cancel_lottery(update, ctx):
         conn.commit()
     await update.message.reply_text(f"✅ 抽奖「{title}」（ID:{lid}）已取消，不产生获奖者。")
 
-# ========== /gg 修改开奖时间 ==========
+# ========== /gg 修改开奖时间（修正） ==========
 async def cmd_change_time(update, ctx):
+    """修改开奖时间：/gg <抽奖ID> <新时间 YYYY-MM-DD HH:MM>"""
     if update.effective_chat.type != 'private':
         return
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
         return
-    args = ctx.args
-    if len(args) != 2:
-        await update.message.reply_text("用法：/gg <抽奖ID> <新时间 YYYY-MM-DD HH:MM>\n例如：/gg 5 2026-08-07 12:00")
+    text = update.message.text.strip()
+    if text.startswith('/gg'):
+        content = text[3:].strip()
+    else:
+        content = text
+
+    time_pattern = r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})'
+    match = re.search(time_pattern, content)
+    if not match:
+        await update.message.reply_text("未找到有效时间，请使用格式：YYYY-MM-DD HH:MM\n例如：/gg 5 2026-08-18 10:00")
+        return
+    new_time_str = match.group(1)
+
+    parts = content.split()
+    if not parts:
+        await update.message.reply_text("请提供抽奖ID。")
         return
     try:
-        lid = int(args[0])
+        lid = int(parts[0])
     except ValueError:
         await update.message.reply_text("抽奖ID必须是数字。")
         return
-    new_time_str = args[1]
+
     try:
         new_dt = datetime.strptime(new_time_str, "%Y-%m-%d %H:%M")
         if new_dt <= now_cn():
@@ -934,7 +947,7 @@ async def cmd_remove_user_lottery(update, ctx):
         f"{', '.join(titles)}"
     )
 
-# ========== 抽奖核心开奖函数（支持多奖品，存储所有获奖者） ==========
+# ========== 抽奖核心开奖函数 ==========
 async def do_draw(lottery_id, bot, force=False):
     with db_connect() as conn:
         c = conn.cursor()
@@ -969,12 +982,11 @@ async def do_draw(lottery_id, bot, force=False):
         winners = shuffled[:winner_count]
 
         first_winner = winners[0] if winners else None
-        # 存储所有获奖者ID（逗号分隔）
         winners_str = ','.join(str(uid) for uid in winners) if winners else ''
         c.execute("UPDATE lotteries SET status=2, winner_id=?, winners=? WHERE id=?", (first_winner, winners_str, lid))
         conn.commit()
 
-        # 获取获奖者昵称（用于显示）
+        # 构建开奖消息，奖品对应获奖者
         winner_links = []
         for uid in winners:
             c2 = conn.cursor()
@@ -1133,7 +1145,7 @@ async def on_msg(update, ctx):
         await update.message.reply_text(msg)
         return
 
-    # ========== 查看近2天开奖记录（支持多个获奖者） ==========
+    # ========== 查看近2天开奖记录（奖品与获奖者对应） ==========
     if text == "开奖":
         now = now_cn()
         two_days_ago = now - timedelta(days=2)
@@ -1153,23 +1165,30 @@ async def on_msg(update, ctx):
         msg = "📋 近2天开奖记录：\n\n"
         for idx, (lid, title, prize, draw_time, winners_str) in enumerate(rows, 1):
             display_prize = prize.replace(',', '、').replace('，', '、')
-            # 解析获奖者
-            winner_links = []
+            prize_list = [p.strip() for p in re.split(r'[,，]', prize) if p.strip()]
+            if not prize_list:
+                prize_list = ["未命名奖品"]
+            winner_ids = []
             if winners_str:
                 winner_ids = [int(x) for x in winners_str.split(',') if x.strip().isdigit()]
-                for wid in winner_ids:
+            items = []
+            for i, p in enumerate(prize_list):
+                if i < len(winner_ids):
+                    wid = winner_ids[i]
                     with db_connect() as conn2:
                         c2 = conn2.cursor()
                         c2.execute("SELECT nickname FROM users WHERE user_id=?", (wid,))
                         wrow = c2.fetchone()
                         name = wrow[0] if wrow else str(wid)
-                        winner_links.append(f'<a href="tg://user?id={wid}">{name}</a>')
-            if not winner_links:
-                winner_links = ["未记录"]
+                    winner_link = f'<a href="tg://user?id={wid}">{name}</a>'
+                    items.append(f"{p} → {winner_link}")
+                else:
+                    items.append(f"{p} → ❌ 无人获得")
             msg += f"{idx}. 🎯 标题：{title}\n"
-            msg += f"   🎁 奖品：{display_prize}\n"
             msg += f"   🕒 开奖时间：{draw_time}\n"
-            msg += f"   🏆 获奖者：{', '.join(winner_links)}\n\n"
+            for item in items:
+                msg += f"   🎁 {item}\n"
+            msg += "\n"
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
         return
 
