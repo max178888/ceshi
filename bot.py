@@ -14,7 +14,7 @@ def now_cn():
     return datetime.now(CHINA_TZ).replace(tzinfo=None)
 
 # ========== 配置 ==========
-TOKEN = "YOUR_BOT_TOKEN_HERE"   # 请替换为你的Token
+TOKEN = "8179579064:AAF57RUAH5TVtrW4qdA4_wIAtWkRAAkqkvo"   # 请替换为你的Token
 ALLOWED_GROUPS = [-1003002241602, -1003745425265, -1003720878201]  # 替换为你的群组ID
 ADMIN_IDS = [8354445328, 877039616, 42438298]  # 替换为管理员ID
 
