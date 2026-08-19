@@ -14,7 +14,7 @@ def now_cn():
     return datetime.now(CHINA_TZ).replace(tzinfo=None)
 
 # ========== 配置 ==========
-TOKEN = "8179579064:AAF57RUAH5TVtrW4qdA4_wIAtWkRAAkqkvo"   # 请替换为你的Token
+TOKEN = "YOUR_BOT_TOKEN_HERE"   # 请替换为你的Token
 ALLOWED_GROUPS = [-1003002241602, -1003745425265, -1003720878201]  # 替换为你的群组ID
 ADMIN_IDS = [8354445328, 877039616, 42438298]  # 替换为管理员ID
 
@@ -801,7 +801,7 @@ async def cmd_cancel_lottery(update, ctx):
         conn.commit()
     await update.message.reply_text(f"✅ 抽奖「{title}」（ID:{lid}）已取消，不产生获奖者。")
 
-# ========== /gg 修改开奖时间（修正） ==========
+# ========== /gg 修改开奖时间 ==========
 async def cmd_change_time(update, ctx):
     """修改开奖时间：/gg <抽奖ID> <新时间 YYYY-MM-DD HH:MM>"""
     if update.effective_chat.type != 'private':
@@ -986,7 +986,6 @@ async def do_draw(lottery_id, bot, force=False):
         c.execute("UPDATE lotteries SET status=2, winner_id=?, winners=? WHERE id=?", (first_winner, winners_str, lid))
         conn.commit()
 
-        # 构建开奖消息，奖品对应获奖者
         winner_links = []
         for uid in winners:
             c2 = conn.cursor()
@@ -1164,7 +1163,6 @@ async def on_msg(update, ctx):
             return
         msg = "📋 近2天开奖记录：\n\n"
         for idx, (lid, title, prize, draw_time, winners_str) in enumerate(rows, 1):
-            display_prize = prize.replace(',', '、').replace('，', '、')
             prize_list = [p.strip() for p in re.split(r'[,，]', prize) if p.strip()]
             if not prize_list:
                 prize_list = ["未命名奖品"]
@@ -1281,7 +1279,7 @@ async def on_msg(update, ctx):
                 c2.execute("UPDATE lotteries SET msg_count = msg_count + 1 WHERE id=? AND status=0", (lid,))
                 conn2.commit()
 
-    # ===== 骰子下注 =====
+    # ===== 骰子下注（先检查重复，再扣分） =====
     dice_match = re.match(r'^押\s+(\S+)\s+(\d+(?:\.\d+)?)$', text) or re.match(r'^押\s+(\d+(?:\.\d+)?)\s+(\S+)$', text)
     if dice_match:
         if dice_match.group(1).replace('.', '').isdigit():
@@ -1311,8 +1309,18 @@ async def on_msg(update, ctx):
                 await update.message.reply_text("游戏初始化失败，请稍后再试。")
                 return
 
+        round_id = state['round_id']
         uid = update.message.from_user.id
         name = update.message.from_user.first_name
+
+        # 先检查是否已经押注过（防止重复扣分）
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT 1 FROM dice_bets WHERE round_id=? AND user_id=?", (round_id, uid))
+            if c.fetchone():
+                await update.message.reply_text("您在本期骰子中已经下注过了，不能重复下注。")
+                return
+
         get_user(uid, name)
         bal = get_coins(uid)
         if bal < amount:
@@ -1322,13 +1330,7 @@ async def on_msg(update, ctx):
             await update.message.reply_text("下注失败，请稍后再试。")
             return
 
-        round_id = state['round_id']
-        with db_connect() as conn:
-            c = conn.cursor()
-            c.execute("SELECT 1 FROM dice_bets WHERE round_id=? AND user_id=?", (round_id, uid))
-            if c.fetchone():
-                await update.message.reply_text("您在本期骰子中已经下注过了，不能重复下注。")
-                return
+        # 插入押注记录
         with db_connect() as conn:
             c = conn.cursor()
             c.execute("INSERT INTO dice_bets (round_id, user_id, amount, bet_type, win) VALUES (?,?,?,?,?)",
