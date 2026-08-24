@@ -1190,7 +1190,7 @@ async def on_msg(update, ctx):
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
         return
 
-    # ========== 低保命令 ==========
+    # ========== 低保命令（每日可领10次） ==========
     if text == "低保":
         uid = update.message.from_user.id
         name = update.message.from_user.first_name
@@ -1200,13 +1200,13 @@ async def on_msg(update, ctx):
             await update.message.reply_text("您的学分已达到或超过 5 分，无需领取低保。")
             return
         today_count = get_welfare_today_count(uid)
-        if today_count >= 5:
-            await update.message.reply_text("您今天已领取 5 次低保，已达上限，请明天再试。")
+        if today_count >= 10:
+            await update.message.reply_text("您今天已领取 10 次低保，已达上限，请明天再试。")
             return
         add_coins(uid, 5, "每日低保领取")
         add_welfare_record(uid)
         new_bal = get_coins(uid)
-        remaining = 5 - (today_count + 1)
+        remaining = 10 - (today_count + 1)
         await update.message.reply_text(
             f"✅ 低保发放成功！\n"
             f"您当前余额：{new_bal:.2f} 学分\n"
@@ -1279,7 +1279,7 @@ async def on_msg(update, ctx):
                 c2.execute("UPDATE lotteries SET msg_count = msg_count + 1 WHERE id=? AND status=0", (lid,))
                 conn2.commit()
 
-    # ===== 骰子下注（先检查重复，再扣分） =====
+    # ===== 骰子下注（已取消100分上限和每场一次限制） =====
     dice_match = re.match(r'^押\s+(\S+)\s+(\d+(?:\.\d+)?)$', text) or re.match(r'^押\s+(\d+(?:\.\d+)?)\s+(\S+)$', text)
     if dice_match:
         if dice_match.group(1).replace('.', '').isdigit():
@@ -1295,9 +1295,7 @@ async def on_msg(update, ctx):
         if amount <= 0:
             await update.message.reply_text("下注金额必须为正数。")
             return
-        if amount > 100:
-            await update.message.reply_text("押注金额不能超过 100 学分。")
-            return
+        # 已删除押注上限检查
 
         state = get_dice_state()
         if state['status'] != 'active':
@@ -1313,13 +1311,7 @@ async def on_msg(update, ctx):
         uid = update.message.from_user.id
         name = update.message.from_user.first_name
 
-        # 先检查是否已经押注过（防止重复扣分）
-        with db_connect() as conn:
-            c = conn.cursor()
-            c.execute("SELECT 1 FROM dice_bets WHERE round_id=? AND user_id=?", (round_id, uid))
-            if c.fetchone():
-                await update.message.reply_text("您在本期骰子中已经下注过了，不能重复下注。")
-                return
+        # 已删除重复押注检查
 
         get_user(uid, name)
         bal = get_coins(uid)
