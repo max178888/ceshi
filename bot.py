@@ -14,9 +14,9 @@ def now_cn():
     return datetime.now(CHINA_TZ).replace(tzinfo=None)
 
 # ========== 配置 ==========
-TOKEN = "8179579064:AAF57RUAH5TVtrW4qdA4_wIAtWkRAAkqkvo"   # 请替换为你的Token
-ALLOWED_GROUPS = [-1003002241602, -1003745425265, -1003720878201]  # 替换为你的群组ID
-ADMIN_IDS = [8354445328, 877039616, 42438298]  # 替换为管理员ID
+TOKEN = "8704946400:AAG-DjMphCj9CSiQlBQyK_vOd7RDVw6M61w"  # 请替换为实际Token
+ALLOWED_GROUPS = [-1003026119277, -1003720878201]   # 仅允许这两个群组
+ADMIN_IDS = [8354445328,7988979116,877039616,8678638700,8542250809,7988979116,53539256,736383766,42438298,34415852]
 
 BASE_DROP_PROB = 0.14
 TRIPLE_MULTIPLIER = 3
@@ -327,13 +327,43 @@ async def cb(update, ctx):
                 reply_markup=Markup([[Btn("🔙 返回钱包", callback_data="back")]])
             )
             return
+        confirm_kb = Markup([
+            [Btn("✅ 确认兑换", callback_data=f"confirm_buy_{iid}")],
+            [Btn("🔙 取消", callback_data="back_to_shop")]
+        ])
+        await query.edit_message_text(
+            f"❓ 确认兑换 {n}？\n消耗：{p} 学分\n当前余额：{current:.2f} 学分\n\n请确认是否兑换。",
+            reply_markup=confirm_kb
+        )
+    elif data.startswith("confirm_buy_"):
+        iid = int(data.split("_")[2])
+        item = next((i for i in SHOP if i[0] == iid), None)
+        if not item:
+            await query.edit_message_text("❌ 商品不存在")
+            return
+        _, n, p = item
+        current = get_coins(uid)
+        remaining = get_remaining(iid)
+        if remaining is not None and remaining <= 0:
+            await query.edit_message_text(
+                "❌ 商品已换完，下次早点来哦！",
+                reply_markup=Markup([[Btn("🔙 返回钱包", callback_data="back")]])
+            )
+            return
+        if current < p:
+            await query.edit_message_text(
+                f"❌ 学分不足！需要 {p} 学分，你只有 {current:.2f} 学分",
+                reply_markup=Markup([[Btn("🔙 返回钱包", callback_data="back")]])
+            )
+            return
         if sub_coins(uid, p, f"购买 {n}"):
             if remaining is not None:
                 decrease_remaining(iid)
             new_balance = get_coins(uid)
+            success_kb = Markup([[Btn("🔙 返回钱包", callback_data="back")]])
             await query.edit_message_text(
-                f"✅ {n} 兑换成功！消耗 {p} 学分",
-                reply_markup=Markup([[Btn("🔙 返回钱包", callback_data="back")]])
+                f"✅ {n} 兑换成功！消耗 {p} 学分，当前余额 {new_balance:.2f} 学分。",
+                reply_markup=success_kb
             )
             if update.effective_chat.type in ('group', 'supergroup'):
                 try:
@@ -366,6 +396,12 @@ async def cb(update, ctx):
                 "❌ 兑换失败，请稍后再试",
                 reply_markup=Markup([[Btn("🔙 返回钱包", callback_data="back")]])
             )
+    elif data == "back_to_shop":
+        bal = get_coins(uid)
+        await query.edit_message_text(
+            f"🛒 学分商城\n💎 当前余额：{bal:.2f} 学分\n点击下方按钮兑换商品：",
+            reply_markup=shop_kb()
+        )
 
     # ---------- 抽奖参与回调 ----------
     elif data.startswith("lottery_join_"):
@@ -1144,7 +1180,7 @@ async def on_msg(update, ctx):
         await update.message.reply_text(msg)
         return
 
-    # ========== 查看近2天开奖记录（奖品与获奖者对应） ==========
+    # ========== 查看近2天开奖记录 ==========
     if text == "开奖":
         now = now_cn()
         two_days_ago = now - timedelta(days=2)
@@ -1190,12 +1226,28 @@ async def on_msg(update, ctx):
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
         return
 
-    # ========== 低保命令（每日可领10次） ==========
+    # ========== 低保命令（检查是否有进行中的骰子投注） ==========
     if text == "低保":
         uid = update.message.from_user.id
         name = update.message.from_user.first_name
         get_user(uid, name)
         bal = get_coins(uid)
+
+        # 检查是否有进行中的骰子投注（当前活跃轮次）
+        with db_connect() as conn:
+            c = conn.cursor()
+            # 获取当前轮次
+            c.execute("SELECT value FROM dice_state WHERE key='current_round'")
+            row = c.fetchone()
+            if row:
+                current_round = int(row[0])
+                if current_round > 0:
+                    # 检查该用户在当前轮次是否有未结算的投注
+                    c.execute("SELECT 1 FROM dice_bets WHERE round_id=? AND user_id=? AND win IS NULL", (current_round, uid))
+                    if c.fetchone():
+                        await update.message.reply_text("您有进行中的骰子投注，无法领取低保，请等待开奖结果后再试。")
+                        return
+
         if bal >= 5:
             await update.message.reply_text("您的学分已达到或超过 5 分，无需领取低保。")
             return
@@ -1279,7 +1331,7 @@ async def on_msg(update, ctx):
                 c2.execute("UPDATE lotteries SET msg_count = msg_count + 1 WHERE id=? AND status=0", (lid,))
                 conn2.commit()
 
-    # ===== 骰子下注（已取消100分上限和每场一次限制） =====
+    # ===== 骰子下注（无限制） =====
     dice_match = re.match(r'^押\s+(\S+)\s+(\d+(?:\.\d+)?)$', text) or re.match(r'^押\s+(\d+(?:\.\d+)?)\s+(\S+)$', text)
     if dice_match:
         if dice_match.group(1).replace('.', '').isdigit():
@@ -1295,7 +1347,6 @@ async def on_msg(update, ctx):
         if amount <= 0:
             await update.message.reply_text("下注金额必须为正数。")
             return
-        # 已删除押注上限检查
 
         state = get_dice_state()
         if state['status'] != 'active':
@@ -1311,8 +1362,6 @@ async def on_msg(update, ctx):
         uid = update.message.from_user.id
         name = update.message.from_user.first_name
 
-        # 已删除重复押注检查
-
         get_user(uid, name)
         bal = get_coins(uid)
         if bal < amount:
@@ -1322,7 +1371,6 @@ async def on_msg(update, ctx):
             await update.message.reply_text("下注失败，请稍后再试。")
             return
 
-        # 插入押注记录
         with db_connect() as conn:
             c = conn.cursor()
             c.execute("INSERT INTO dice_bets (round_id, user_id, amount, bet_type, win) VALUES (?,?,?,?,?)",
