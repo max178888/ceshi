@@ -567,7 +567,7 @@ async def admin_credit_handler(update, ctx):
         f"📚 当前余额：{new_balance:.2f} 学分"
     )
 
-# ========== 新增：私聊管理员加学分（使用英文命令 /credit） ==========
+# ========== 私聊管理员加学分（使用 ctx.args） ==========
 async def admin_credit_private(update, ctx):
     """私聊处理 /credit @用户名 金额"""
     if update.effective_chat.type != 'private':
@@ -576,15 +576,12 @@ async def admin_credit_private(update, ctx):
     if user_id not in ADMIN_IDS:
         await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
         return
-    text = update.message.text.strip()
-    # 匹配 /credit @username 金额  或 /credit 用户ID 金额
-    pattern = r'^/credit\s+([@\d]+)\s+([+-]?\d+(?:\.\d+)?)'
-    match = re.match(pattern, text)
-    if not match:
+    args = ctx.args
+    if len(args) != 2:
         await update.message.reply_text("格式错误，请使用：/credit @用户名 金额  或 /credit 用户ID 金额\n金额可带正负号，如 +100 或 -50")
         return
-    target_identifier = match.group(1)
-    delta_str = match.group(2)
+    target_identifier = args[0]
+    delta_str = args[1]
     try:
         delta = float(delta_str)
     except ValueError:
@@ -599,7 +596,7 @@ async def admin_credit_private(update, ctx):
             chat = await ctx.bot.get_chat(target_identifier)
             target_uid = chat.id
             target_name = chat.first_name or str(target_uid)
-        except Exception as e:
+        except Exception:
             await update.message.reply_text(f"❌ 无法找到用户 {target_identifier}，请确认用户名正确或使用数字ID。")
             return
     else:
