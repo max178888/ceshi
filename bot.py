@@ -534,6 +534,7 @@ async def test_cb(update, ctx):
 
 # ========== 管理员命令 ==========
 async def admin_credit_handler(update, ctx):
+    # 仅限群聊，回复消息
     if update.effective_chat.type not in ('group', 'supergroup'):
         return
     if update.effective_chat.id not in ALLOWED_GROUPS:
@@ -566,6 +567,68 @@ async def admin_credit_handler(update, ctx):
         f"📚 当前余额：{new_balance:.2f} 学分"
     )
 
+# ========== 新增：私聊管理员加学分 ==========
+async def admin_credit_private(update, ctx):
+    """私聊处理 /学分 @用户名 金额"""
+    if update.effective_chat.type != 'private':
+        return
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    text = update.message.text.strip()
+    # 匹配 /学分 @username 金额  或 /学分 用户ID 金额
+    # 例如：/学分 @someone 100  或 /学分 123456789 -50
+    pattern = r'^/学分\s+([@\d]+)\s+([+-]?\d+(?:\.\d+)?)'
+    match = re.match(pattern, text)
+    if not match:
+        await update.message.reply_text("格式错误，请使用：/学分 @用户名 金额  或 /学分 用户ID 金额\n金额可带正负号，如 +100 或 -50")
+        return
+    target_identifier = match.group(1)
+    delta_str = match.group(2)
+    try:
+        delta = float(delta_str)
+    except ValueError:
+        await update.message.reply_text("金额格式无效，请输入数字。")
+        return
+
+    # 解析目标用户ID
+    target_uid = None
+    target_name = None
+    if target_identifier.startswith('@'):
+        # 通过用户名获取用户信息
+        try:
+            chat = await ctx.bot.get_chat(target_identifier)
+            target_uid = chat.id
+            target_name = chat.first_name or str(target_uid)
+        except Exception as e:
+            await update.message.reply_text(f"❌ 无法找到用户 {target_identifier}，请确认用户名正确或使用数字ID。")
+            return
+    else:
+        # 数字ID
+        try:
+            target_uid = int(target_identifier)
+            # 尝试获取用户信息以获取昵称
+            try:
+                chat = await ctx.bot.get_chat(target_uid)
+                target_name = chat.first_name or str(target_uid)
+            except:
+                target_name = str(target_uid)
+        except ValueError:
+            await update.message.reply_text("❌ 用户ID必须是数字。")
+            return
+
+    # 确保用户存在
+    get_user(target_uid, target_name)
+    add_coins(target_uid, delta, reason=f"管理员 {user_id} 私聊操作")
+    new_balance = get_coins(target_uid)
+    action = "增加" if delta > 0 else "扣除"
+    await update.message.reply_text(
+        f"✅ 已为 {target_name} (ID: {target_uid}) {action} {abs(delta):.2f} 学分\n"
+        f"📚 当前余额：{new_balance:.2f} 学分"
+    )
+
+# ========== 管理员商品管理 ==========
 async def admin_add_item(update, ctx):
     if update.effective_chat.type != 'private':
         return
@@ -1084,7 +1147,8 @@ async def cmd_start(update, ctx):
                 "/additem <名称> <价格> <限量> - 添加商品（限量0为无限）\n"
                 "/listitems - 查看商品列表\n"
                 "/delitem <商品ID> - 删除商品\n"
-                "/学分 +数字 或 /学分 -数字 - 修改用户学分（需回复用户消息）\n"
+                "/学分 +数字 或 /学分 -数字 - 修改用户学分（需回复用户消息）——仅限群聊\n"
+                "私聊：/学分 @用户名 金额  或 /学分 用户ID 金额（可带正负号）\n"
                 "/coins - 查询自己学分\n"
                 "/shop - 打开商城\n"
                 "/start - 显示本帮助\n"
@@ -1226,23 +1290,21 @@ async def on_msg(update, ctx):
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
         return
 
-    # ========== 低保命令（检查是否有进行中的骰子投注） ==========
+    # ========== 低保命令 ==========
     if text == "低保":
         uid = update.message.from_user.id
         name = update.message.from_user.first_name
         get_user(uid, name)
         bal = get_coins(uid)
 
-        # 检查是否有进行中的骰子投注（当前活跃轮次）
+        # 检查是否有进行中的骰子投注
         with db_connect() as conn:
             c = conn.cursor()
-            # 获取当前轮次
             c.execute("SELECT value FROM dice_state WHERE key='current_round'")
             row = c.fetchone()
             if row:
                 current_round = int(row[0])
                 if current_round > 0:
-                    # 检查该用户在当前轮次是否有未结算的投注
                     c.execute("SELECT 1 FROM dice_bets WHERE round_id=? AND user_id=? AND win IS NULL", (current_round, uid))
                     if c.fetchone():
                         await update.message.reply_text("您有进行中的骰子投注，无法领取低保，请等待开奖结果后再试。")
@@ -1331,7 +1393,7 @@ async def on_msg(update, ctx):
                 c2.execute("UPDATE lotteries SET msg_count = msg_count + 1 WHERE id=? AND status=0", (lid,))
                 conn2.commit()
 
-    # ===== 骰子下注（无限制） =====
+    # ===== 骰子下注 =====
     dice_match = re.match(r'^押\s+(\S+)\s+(\d+(?:\.\d+)?)$', text) or re.match(r'^押\s+(\d+(?:\.\d+)?)\s+(\S+)$', text)
     if dice_match:
         if dice_match.group(1).replace('.', '').isdigit():
@@ -1579,10 +1641,15 @@ def main():
     bot = app.bot
     loop = asyncio.get_event_loop()
     loop.create_task(auto_draw_loop(bot))
+    
+    # 群聊中的 /学分 由 MessageHandler 处理（保留原有）
+    app.add_handler(MessageHandler(filters.Regex(r'^/学分'), admin_credit_handler))
+    # 私聊中的 /学分 由 CommandHandler 处理（新增）
+    app.add_handler(CommandHandler("学分", admin_credit_private, filters=filters.ChatType.PRIVATE))
+    
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("coins", cmd_coins))
     app.add_handler(CommandHandler("shop", cmd_shop))
-    app.add_handler(MessageHandler(filters.Regex(r'^/学分'), admin_credit_handler))
     app.add_handler(MessageHandler(filters.Regex(r'^骰子战绩$'), dice_stats))
     app.add_handler(CommandHandler("dice_stats", dice_stats))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_msg))
