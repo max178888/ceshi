@@ -10,7 +10,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 # ========== 中国时区 ==========
 CHINA_TZ = timezone(timedelta(hours=8))
-def now_cn():
+def now_cn(): 
     return datetime.now(CHINA_TZ).replace(tzinfo=None)
 
 # ========== 配置 ==========
