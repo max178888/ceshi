@@ -10,13 +10,13 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 # ========== 中国时区 ==========
 CHINA_TZ = timezone(timedelta(hours=8))
-def now_cn(): 
+def now_cn():
     return datetime.now(CHINA_TZ).replace(tzinfo=None)
 
 # ========== 配置 ==========
-TOKEN = "8179579064:AAF57RUAH5TVtrW4qdA4_wIAtWkRAAkqkvo"   # 请替换为你的Token
-ALLOWED_GROUPS = [-1003002241602, -1003745425265, -1003720878201]  # 替换为你的群组ID
-ADMIN_IDS = [8354445328, 877039616, 42438298]  # 替换为管理员ID
+TOKEN = "8704946400:AAG-DjMphCj9CSiQlBQyK_vOd7RDVw6M61w"  # 请替换为实际Token
+ALLOWED_GROUPS = [-1003026119277, -1003720878201]   # 仅允许这两个群组
+ADMIN_IDS = [8354445328,7988979116,877039616,8678638700,8542250809,7988979116,53539256,736383766,42438298,34415852]
 
 BASE_DROP_PROB = 0.14
 TRIPLE_MULTIPLIER = 3
@@ -567,9 +567,9 @@ async def admin_credit_handler(update, ctx):
         f"📚 当前余额：{new_balance:.2f} 学分"
     )
 
-# ========== 私聊管理员加学分（使用 ctx.args） ==========
+# ========== 私聊管理员加学分 ==========
 async def admin_credit_private(update, ctx):
-    """私聊处理 /credit @用户名 金额"""
+    """私聊处理 /credit @用户名 金额 或 /credit 用户ID 金额 或 /credit 金额（给自己加）"""
     if update.effective_chat.type != 'private':
         return
     user_id = update.effective_user.id
@@ -577,8 +577,44 @@ async def admin_credit_private(update, ctx):
         await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
         return
     args = ctx.args
+    if len(args) == 0:
+        await update.message.reply_text(
+            "格式错误，请使用：\n"
+            "/credit 金额（给自己加）\n"
+            "/credit @用户名 金额\n"
+            "/credit 用户ID 金额\n"
+            "金额可带正负号，如 +100 或 -50"
+        )
+        return
+    # 如果只有一个参数，认为是金额，给自己加
+    if len(args) == 1:
+        delta_str = args[0]
+        try:
+            delta = float(delta_str)
+        except ValueError:
+            await update.message.reply_text("金额格式无效，请输入数字。")
+            return
+        target_uid = user_id
+        target_name = update.effective_user.first_name or str(target_uid)
+        get_user(target_uid, target_name)
+        add_coins(target_uid, delta, reason=f"管理员 {user_id} 给自己加学分")
+        new_balance = get_coins(target_uid)
+        action = "增加" if delta > 0 else "扣除"
+        await update.message.reply_text(
+            f"✅ 已为自己 {action} {abs(delta):.2f} 学分\n"
+            f"📚 当前余额：{new_balance:.2f} 学分"
+        )
+        return
+
+    # 两个参数：用户标识 + 金额
     if len(args) != 2:
-        await update.message.reply_text("格式错误，请使用：/credit @用户名 金额  或 /credit 用户ID 金额\n金额可带正负号，如 +100 或 -50")
+        await update.message.reply_text(
+            "格式错误，请使用：\n"
+            "/credit 金额（给自己加）\n"
+            "/credit @用户名 金额\n"
+            "/credit 用户ID 金额\n"
+            "金额可带正负号，如 +100 或 -50"
+        )
         return
     target_identifier = args[0]
     delta_str = args[1]
@@ -1140,7 +1176,7 @@ async def cmd_start(update, ctx):
                 "/listitems - 查看商品列表\n"
                 "/delitem <商品ID> - 删除商品\n"
                 "群聊：/学分 +数字 或 /学分 -数字（需回复用户消息）\n"
-                "私聊：/credit @用户名 金额  或 /credit 用户ID 金额（可带正负号）\n"
+                "私聊：/credit 金额（给自己加） 或 /credit @用户名 金额  或 /credit 用户ID 金额（可带正负号）\n"
                 "/coins - 查询自己学分\n"
                 "/shop - 打开商城\n"
                 "/start - 显示本帮助\n"
