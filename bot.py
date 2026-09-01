@@ -1074,7 +1074,7 @@ async def cmd_remove_user_lottery(update, ctx):
         f"{', '.join(titles)}"
     )
 
-# ========== 抽奖核心开奖函数 ==========
+# ========== 抽奖核心开奖函数（含向管理员发送中奖ID） ==========
 async def do_draw(lottery_id, bot, force=False):
     with db_connect() as conn:
         c = conn.cursor()
@@ -1130,11 +1130,26 @@ async def do_draw(lottery_id, bot, force=False):
             msg += f"\n🎉 恭喜所有获奖者！"
         else:
             msg += f"\n🎉 恭喜所有获奖者！"
+    # 发送到群组
     for gid in ALLOWED_GROUPS:
         try:
             await bot.send_message(chat_id=gid, text=msg, parse_mode=ParseMode.HTML)
         except Exception as e:
             print(f"发送开奖结果到 {gid} 失败: {e}")
+
+    # ========== 向管理员发送中奖用户ID ==========
+    if winners:
+        admin_msg = f"🎉 抽奖「{title}」已开奖，中奖用户ID列表：\n"
+        for idx, uid in enumerate(winners):
+            prize_name = prize_list[idx] if idx < len(prize_list) else "未分配奖品"
+            admin_msg += f"奖品：{prize_name} → 用户ID：{uid}\n"
+        for aid in ADMIN_IDS:
+            try:
+                await bot.send_message(chat_id=aid, text=admin_msg)
+            except Exception as e:
+                print(f"发送中奖ID给管理员 {aid} 失败: {e}")
+    # ===================================================
+
     return True, f"抽奖 {lid} 已开奖，产生 {len(winners)} 位获奖者。"
 
 # ========== 后台自动开奖任务 ==========
