@@ -567,9 +567,9 @@ async def admin_credit_handler(update, ctx):
         f"📚 当前余额：{new_balance:.2f} 学分"
     )
 
-# ========== 私聊管理员加学分 ==========
+# ========== 私聊管理员加学分（命令 /xf） ==========
 async def admin_credit_private(update, ctx):
-    """私聊处理 /credit @用户名 金额 或 /credit 用户ID 金额 或 /credit 金额（给自己加）"""
+    """私聊处理 /xf @用户名 金额 或 /xf 用户ID 金额 或 /xf 金额（给自己加）"""
     if update.effective_chat.type != 'private':
         return
     user_id = update.effective_user.id
@@ -580,9 +580,9 @@ async def admin_credit_private(update, ctx):
     if len(args) == 0:
         await update.message.reply_text(
             "格式错误，请使用：\n"
-            "/credit 金额（给自己加）\n"
-            "/credit @用户名 金额\n"
-            "/credit 用户ID 金额\n"
+            "/xf 金额（给自己加）\n"
+            "/xf @用户名 金额\n"
+            "/xf 用户ID 金额\n"
             "金额可带正负号，如 +100 或 -50"
         )
         return
@@ -610,9 +610,9 @@ async def admin_credit_private(update, ctx):
     if len(args) != 2:
         await update.message.reply_text(
             "格式错误，请使用：\n"
-            "/credit 金额（给自己加）\n"
-            "/credit @用户名 金额\n"
-            "/credit 用户ID 金额\n"
+            "/xf 金额（给自己加）\n"
+            "/xf @用户名 金额\n"
+            "/xf 用户ID 金额\n"
             "金额可带正负号，如 +100 或 -50"
         )
         return
@@ -1176,7 +1176,7 @@ async def cmd_start(update, ctx):
                 "/listitems - 查看商品列表\n"
                 "/delitem <商品ID> - 删除商品\n"
                 "群聊：/学分 +数字 或 /学分 -数字（需回复用户消息）\n"
-                "私聊：/credit 金额（给自己加） 或 /credit @用户名 金额  或 /credit 用户ID 金额（可带正负号）\n"
+                "私聊：/xf 金额（给自己加） 或 /xf @用户名 金额  或 /xf 用户ID 金额（可带正负号）\n"
                 "/coins - 查询自己学分\n"
                 "/shop - 打开商城\n"
                 "/start - 显示本帮助\n"
@@ -1678,8 +1678,8 @@ def main():
 
     # 群聊中的 /学分 由 MessageHandler 处理（保留原有）
     app.add_handler(MessageHandler(filters.Regex(r'^/学分'), admin_credit_handler))
-    # 私聊中的 /credit 命令（英文命令，用于私聊加学分）
-    app.add_handler(CommandHandler("credit", admin_credit_private, filters=filters.ChatType.PRIVATE))
+    # 私聊中的 /xf 命令（用于私聊加学分）
+    app.add_handler(CommandHandler("xf", admin_credit_private, filters=filters.ChatType.PRIVATE))
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("coins", cmd_coins))
