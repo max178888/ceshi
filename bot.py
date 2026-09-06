@@ -1203,7 +1203,7 @@ async def cmd_start(update, ctx):
                 "/QL <抽奖ID> - 重置抽奖（清空参与者和获奖者）\n"
                 "/sb <用户ID/@用户名> - 取消某人在所有进行中抽奖的参与资格（不退还学分）\n"
                 "\n📦 竞拍管理（私聊）：\n"
-                "/jp <标题> <商品> <起拍价> <结束时间> - 创建竞拍\n"
+                "/jp <标题> <商品> <起拍价> <结束时间> - 创建竞拍（时间格式 YYYY-MM-DD HH:MM）\n"
                 "/qxpm <竞拍ID> - 取消竞拍并退款\n"
                 "\n群组命令：\n"
                 "/竞拍 - 列出所有进行中的竞拍\n"
@@ -1889,15 +1889,25 @@ async def cmd_jp(update, ctx):
         return
 
     args = ctx.args
-    if len(args) < 4:
+    if len(args) < 5:  # 至少需要：标题 商品 起拍价 日期 时间
         await update.message.reply_text(
             "用法：/jp <标题> <商品> <起拍价> <结束时间>\n"
+            "结束时间格式必须为：YYYY-MM-DD HH:MM（例如 2026-09-06 09:10）\n"
             "示例：/jp 八月福利 限量手办 100 2026-09-07 20:00"
         )
         return
 
-    # 解析结束时间（最后一部分）
-    time_str = args[-1]
+    # 起拍价是倒数第三个参数（最后两个是日期和时间）
+    try:
+        starting_price = float(args[-3])
+        if starting_price <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("起拍价必须为正数数字。")
+        return
+
+    # 合并最后两个参数为完整时间字符串
+    time_str = args[-2] + ' ' + args[-1]
     try:
         end_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
     except ValueError:
@@ -1907,18 +1917,9 @@ async def cmd_jp(update, ctx):
         await update.message.reply_text(f"结束时间必须在未来。当前时间：{now_cn().strftime('%Y-%m-%d %H:%M')}")
         return
 
-    # 解析起拍价（倒数第二部分）
-    try:
-        starting_price = float(args[-2])
-        if starting_price <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("起拍价必须为正数。")
-        return
-
-    # 标题和商品名：标题为第一个词，商品为中间部分
+    # 标题为第一个参数，商品为中间部分（从第二个到倒数第四个）
     title = args[0]
-    item_name = ' '.join(args[1:-2]) if len(args) > 3 else "未命名商品"
+    item_name = ' '.join(args[1:-3]) if len(args) > 4 else "未命名商品"
 
     try:
         auction_id = create_auction(update.effective_user.id, item_name, title, starting_price, end_time)
