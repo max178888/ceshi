@@ -1879,7 +1879,7 @@ def cancel_auction(auction_id):
         conn.commit()
     return True, f"竞拍 #{auction_id} 已取消，{f'已退还 {current_price} 学分给出价人' if current_bidder else '无出价记录'}"
 
-# ---------- 新竞拍命令 ----------
+# ---------- 竞拍命令 ----------
 async def cmd_jp(update, ctx):
     """私聊管理员创建竞拍：/jp <标题> <商品> <起拍价> <结束时间>"""
     if update.effective_chat.type != 'private':
@@ -1934,15 +1934,33 @@ async def cmd_jp(update, ctx):
     except Exception as e:
         await update.message.reply_text(f"❌ 创建失败：{e}")
 
+# 注意：此函数用于处理 /竞拍 消息，由 MessageHandler 调用，因此不依赖 ctx.args
 async def cmd_bid_or_list(update, ctx):
-    """群组命令 /竞拍：无参数时列表，带参数时出价"""
+    """处理群组中 /竞拍 命令（无参数时列表，有参数时出价）"""
     if update.effective_chat.type not in ('group', 'supergroup'):
         return
     if update.effective_chat.id not in ALLOWED_GROUPS:
         await update.message.reply_text("该群组未授权使用本机器人。")
         return
 
-    args = ctx.args
+    # 从消息文本中提取参数（去掉命令本身）
+    text = update.message.text.strip()
+    # 匹配 /竞拍 或 /竞拍@botusername
+    if text.startswith('/竞拍'):
+        parts = text.split()
+        # 去掉命令部分（可能包含 @）
+        if len(parts) > 0:
+            # 如果第一个词是 /竞拍 或 /竞拍@xxx，则移除
+            if parts[0].startswith('/竞拍'):
+                args = parts[1:]
+            else:
+                args = parts
+        else:
+            args = []
+    else:
+        # 如果不是 /竞拍 开头，忽略（安全防护）
+        return
+
     # 无参数 → 列出所有进行中的竞拍详情
     if not args:
         auctions = list_active_auctions()
@@ -2111,9 +2129,10 @@ def main():
     app.add_handler(CommandHandler("ql", cmd_clean_lottery))
     app.add_handler(CommandHandler("sb", cmd_remove_user_lottery))
 
-    # ========== 新增竞拍命令 ==========
+    # ========== 竞拍命令 ==========
     app.add_handler(CommandHandler("jp", cmd_jp, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("竞拍", cmd_bid_or_list, filters=filters.ChatType.GROUP))
+    # 使用 MessageHandler 匹配以 /竞拍 开头的消息，避免 CommandHandler 不支持中文命令名
+    app.add_handler(MessageHandler(filters.Regex(r'^/竞拍\b'), cmd_bid_or_list))
     app.add_handler(CommandHandler("qxpm", cmd_qxpm, filters=filters.ChatType.PRIVATE))
 
     app.run_polling(allowed_updates=["message", "callback_query"])
