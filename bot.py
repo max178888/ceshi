@@ -1262,6 +1262,9 @@ async def on_msg(update, ctx):
         if update.effective_chat.id not in ALLOWED_GROUPS:
             return
     text = update.message.text.strip()
+    # 跳过以 / 开头的消息（避免干扰命令，但注意中文命令会在此前被捕获）
+    if text.startswith('/'):
+        return
     if text == "商城":
         uid = update.message.from_user.id
         name = update.message.from_user.first_name
@@ -1421,9 +1424,6 @@ async def on_msg(update, ctx):
             else:
                 msg += "点击下方按钮参与！"
             await update.message.reply_text(msg, reply_markup=kb)
-        return
-
-    if text.startswith('/'):
         return
 
     # ===== 发言统计 =====
@@ -2116,7 +2116,13 @@ def main():
     app.add_handler(CommandHandler("shop", cmd_shop))
     app.add_handler(MessageHandler(filters.Regex(r'^骰子战绩$'), dice_stats))
     app.add_handler(CommandHandler("dice_stats", dice_stats))
+
+    # ========== 竞拍命令（必须放在 on_msg 之前，避免被拦截） ==========
+    app.add_handler(MessageHandler(filters.Regex(r'^/竞拍\b'), cmd_bid_or_list))
+
+    # ========== 通用消息处理器（处理非命令文本） ==========
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_msg))
+
     app.add_handler(CallbackQueryHandler(cb))
     app.add_handler(CommandHandler("test", test_callback))
     app.add_handler(CallbackQueryHandler(test_cb, pattern="^test$"))
@@ -2130,10 +2136,8 @@ def main():
     app.add_handler(CommandHandler("ql", cmd_clean_lottery))
     app.add_handler(CommandHandler("sb", cmd_remove_user_lottery))
 
-    # ========== 竞拍命令 ==========
+    # ========== 竞拍其他命令 ==========
     app.add_handler(CommandHandler("jp", cmd_jp, filters=filters.ChatType.PRIVATE))
-    # 使用 MessageHandler 匹配以 /竞拍 开头的消息，避免 CommandHandler 不支持中文命令名
-    app.add_handler(MessageHandler(filters.Regex(r'^/竞拍\b'), cmd_bid_or_list))
     app.add_handler(CommandHandler("qxpm", cmd_qxpm, filters=filters.ChatType.PRIVATE))
 
     app.run_polling(allowed_updates=["message", "callback_query"])
