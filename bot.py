@@ -1206,6 +1206,7 @@ async def cmd_start(update, ctx):
                 "/jp <标题> <商品> <起拍价> <结束时间> [-j 最小加价] - 创建竞拍\n"
                 "  例如：/jp 八月惊喜 手办 100 2026-09-08 07:30 -j 10\n"
                 "/qxpm <竞拍ID> - 取消竞拍并退款\n"
+                "/jplist - 查看最近5期获胜者名单\n"
                 "\n群组命令（支持 /竞拍 或 竞拍）：\n"
                 "竞拍 - 列出所有进行中的竞拍详情\n"
                 "竞拍 <金额> - 对最新竞拍出价\n"
@@ -1694,7 +1695,7 @@ async def dice_stats(update, ctx):
         await update.message.reply_text(f"🎲 您的骰子战绩：\n胜场：{wins}\n总局数：{total}\n胜率：{rate:.1f}%")
 
 # ============================================================
-# ========== 竞拍模块（全新） ==========
+# ========== 竞拍模块 ==========
 # ============================================================
 
 def init_auction_tables():
@@ -1880,6 +1881,7 @@ def place_bid(uid, auction_id, amount):
 
     return True, f"出价成功，当前最高价 {amount} 学分"
 
+# ===== 修改后的 end_auction：获胜者带超链接 =====
 def end_auction(auction_id, force=False):
     auction = get_auction(auction_id)
     if not auction:
@@ -1901,7 +1903,9 @@ def end_auction(auction_id, force=False):
             c2.execute("SELECT nickname FROM users WHERE user_id=?", (winner_id,))
             row = c2.fetchone()
             winner_name = row[0] if row else str(winner_id)
-        msg = f"🏆 竞拍 #{auction_id} 「{auction['item_name']}」已结束，获胜者为 {winner_name}，成交价 {auction['current_price']} 学分。"
+        # 增加超链接
+        winner_link = f'<a href="tg://user?id={winner_id}">{winner_name}</a>'
+        msg = f"🏆 竞拍 #{auction_id} 「{auction['item_name']}」已结束，获胜者为 {winner_link}，成交价 {auction['current_price']} 学分。"
     else:
         msg = f"📢 竞拍 #{auction_id} 「{auction['item_name']}」已结束，无人出价，流拍。"
     return True, msg
@@ -2152,6 +2156,39 @@ async def cmd_qxpm(update, ctx):
     success, msg = cancel_auction(auction_id)
     await update.message.reply_text(msg)
 
+# ===== 新增：/jplist 查看最近5期获胜者 =====
+async def cmd_jplist(update, ctx):
+    """私聊查看最近5期竞拍获胜者名单"""
+    if update.effective_chat.type != 'private':
+        return
+
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, item_name, current_price, current_bidder_id
+            FROM auctions
+            WHERE status = 1 AND current_bidder_id IS NOT NULL
+            ORDER BY id DESC
+            LIMIT 5
+        """)
+        rows = c.fetchall()
+
+    if not rows:
+        await update.message.reply_text("📭 暂无已结束的竞拍记录。")
+        return
+
+    lines = ["🏆 最近5期获胜者名单：\n"]
+    for idx, (aid, item, price, winner_id) in enumerate(rows, 1):
+        with db_connect() as conn2:
+            c2 = conn2.cursor()
+            c2.execute("SELECT nickname FROM users WHERE user_id=?", (winner_id,))
+            row = c2.fetchone()
+            winner_name = row[0] if row else str(winner_id)
+        winner_link = f'<a href="tg://user?id={winner_id}">{winner_name}</a>'
+        lines.append(f"{idx}. 第{aid}期 「{item}」 → 获胜者 {winner_link}，成交价 {price} 学分")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
 # ---------- 后台自动结束竞拍任务 ----------
 async def auto_end_auctions_loop(bot):
     while True:
@@ -2165,7 +2202,7 @@ async def auto_end_auctions_loop(bot):
                 if success:
                     for gid in ALLOWED_GROUPS:
                         try:
-                            await bot.send_message(chat_id=gid, text=msg)
+                            await bot.send_message(chat_id=gid, text=msg, parse_mode=ParseMode.HTML)
                         except Exception as e:
                             print(f"发送竞拍结束通知到 {gid} 失败: {e}")
                     print(f"自动结束竞拍 {auction_id}: {msg}")
@@ -2227,6 +2264,7 @@ def main():
     # ========== 竞拍其他命令（私聊） ==========
     app.add_handler(CommandHandler("jp", cmd_jp, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("qxpm", cmd_qxpm, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("jplist", cmd_jplist, filters=filters.ChatType.PRIVATE))  # 新增
 
     app.run_polling(allowed_updates=["message", "callback_query"])
 
