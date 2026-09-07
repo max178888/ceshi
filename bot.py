@@ -1203,12 +1203,13 @@ async def cmd_start(update, ctx):
                 "/QL <抽奖ID> - 重置抽奖（清空参与者和获奖者）\n"
                 "/sb <用户ID/@用户名> - 取消某人在所有进行中抽奖的参与资格（不退还学分）\n"
                 "\n📦 竞拍管理（私聊）：\n"
-                "/jp <标题> <商品> <起拍价> <结束时间> - 创建竞拍（时间格式 YYYY-MM-DD HH:MM）\n"
+                "/jp <标题> <商品> <起拍价> <结束时间> [-j 最小加价] - 创建竞拍\n"
+                "  例如：/jp 八月惊喜 手办 100 2026-09-08 07:30 -j 10\n"
                 "/qxpm <竞拍ID> - 取消竞拍并退款\n"
-                "\n群组命令：\n"
-                "/竞拍 - 列出所有进行中的竞拍\n"
-                "/竞拍 <金额> - 对最新竞拍出价\n"
-                "/竞拍 <ID> <金额> - 对指定竞拍出价"
+                "\n群组命令（支持 /竞拍 或 竞拍）：\n"
+                "竞拍 - 列出所有进行中的竞拍详情\n"
+                "竞拍 <金额> - 对最新竞拍出价\n"
+                "竞拍 <ID> <金额> - 对指定竞拍出价"
             )
             await update.message.reply_text(help_text)
         else:
@@ -1262,9 +1263,17 @@ async def on_msg(update, ctx):
         if update.effective_chat.id not in ALLOWED_GROUPS:
             return
     text = update.message.text.strip()
-    # 跳过以 / 开头的消息（避免干扰命令，但注意中文命令会在此前被捕获）
+    # 跳过以 / 开头的命令（但保留 /竞拍 已在外部处理）
     if text.startswith('/'):
         return
+
+    # ---------- 处理不带斜杠的“竞拍”命令 ----------
+    if text == "竞拍" or text.startswith("竞拍 "):
+        # 构造一个模拟的 /竞拍 消息，让 cmd_bid_or_list 处理
+        # 直接调用并传入 update, ctx，该函数会从 update.message.text 解析
+        await cmd_bid_or_list(update, ctx)
+        return
+
     if text == "商城":
         uid = update.message.from_user.id
         name = update.message.from_user.first_name
@@ -1686,7 +1695,6 @@ async def dice_stats(update, ctx):
 
 # ============================================================
 # ========== 竞拍模块（全新） ==========
-# 说明：管理员私聊 /jp 创建，群组 /竞拍 列表或出价，管理员私聊 /qxpm 取消
 # ============================================================
 
 def init_auction_tables():
@@ -1704,9 +1712,15 @@ def init_auction_tables():
                 end_time TIMESTAMP NOT NULL,
                 status INTEGER DEFAULT 0,  -- 0:进行中, 1:已结束, 2:已取消
                 created_by INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                min_increment REAL DEFAULT 0
             )
         """)
+        # 为旧表增加 min_increment 列（如果不存在）
+        c.execute("PRAGMA table_info(auctions)")
+        existing_cols = [col[1] for col in c.fetchall()]
+        if "min_increment" not in existing_cols:
+            c.execute("ALTER TABLE auctions ADD COLUMN min_increment REAL DEFAULT 0")
         c.execute("""
             CREATE TABLE IF NOT EXISTS bids (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1721,18 +1735,20 @@ def init_auction_tables():
         conn.commit()
 
 # ---------- 核心竞拍函数 ----------
-def create_auction(creator_id, item_name, description, starting_price, end_time):
-    """直接指定结束时间（datetime对象）"""
+def create_auction(creator_id, item_name, description, starting_price, end_time, min_increment=0):
+    """直接指定结束时间（datetime对象），增加最小加价参数"""
     if starting_price <= 0:
         raise ValueError("起拍价必须大于0")
     if end_time <= now_cn():
         raise ValueError("结束时间必须在未来")
+    if min_increment < 0:
+        raise ValueError("最小加价不能为负数")
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("""
-            INSERT INTO auctions (item_name, description, starting_price, current_price, current_bidder_id, end_time, status, created_by)
-            VALUES (?, ?, ?, ?, NULL, ?, 0, ?)
-        """, (item_name, description, starting_price, starting_price, end_time, creator_id))
+            INSERT INTO auctions (item_name, description, starting_price, current_price, current_bidder_id, end_time, status, created_by, min_increment)
+            VALUES (?, ?, ?, ?, NULL, ?, 0, ?, ?)
+        """, (item_name, description, starting_price, starting_price, end_time, creator_id, min_increment))
         auction_id = c.lastrowid
         conn.commit()
     return auction_id
@@ -1742,7 +1758,7 @@ def get_auction(auction_id):
         c = conn.cursor()
         c.execute("""
             SELECT id, item_name, description, starting_price, current_price, current_bidder_id,
-                   end_time, status, created_by, created_at
+                   end_time, status, created_by, created_at, min_increment
             FROM auctions WHERE id=?
         """, (auction_id,))
         row = c.fetchone()
@@ -1758,15 +1774,16 @@ def get_auction(auction_id):
             'end_time': datetime.fromisoformat(row[6]) if isinstance(row[6], str) else row[6],
             'status': row[7],
             'created_by': row[8],
-            'created_at': row[9]
+            'created_at': row[9],
+            'min_increment': row[10] if len(row) > 10 else 0
         }
 
 def list_active_auctions(limit=10):
-    """按创建时间倒序（最新优先）返回进行中的竞拍"""
+    """按创建时间倒序（最新优先）返回进行中的竞拍（仅返回基础信息）"""
     with db_connect() as conn:
         c = conn.cursor()
         c.execute("""
-            SELECT id, item_name, current_price, current_bidder_id, end_time
+            SELECT id, item_name, current_price, current_bidder_id, end_time, starting_price, description, min_increment
             FROM auctions
             WHERE status=0 AND end_time > ?
             ORDER BY id DESC
@@ -1780,9 +1797,35 @@ def list_active_auctions(limit=10):
             'item_name': row[1],
             'current_price': row[2],
             'current_bidder_id': row[3],
-            'end_time': datetime.fromisoformat(row[4]) if isinstance(row[4], str) else row[4]
+            'end_time': datetime.fromisoformat(row[4]) if isinstance(row[4], str) else row[4],
+            'starting_price': row[5],
+            'description': row[6],
+            'min_increment': row[7] if len(row) > 7 else 0
         })
     return result
+
+def get_bid_history(auction_id, limit=10):
+    """获取出价记录（含用户昵称）"""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT b.user_id, b.amount, b.time, u.nickname
+            FROM bids b
+            LEFT JOIN users u ON b.user_id = u.user_id
+            WHERE b.auction_id = ?
+            ORDER BY b.time DESC
+            LIMIT ?
+        """, (auction_id, limit))
+        rows = c.fetchall()
+    history = []
+    for uid, amount, time, nickname in rows:
+        history.append({
+            'user_id': uid,
+            'amount': amount,
+            'time': datetime.fromisoformat(time) if isinstance(time, str) else time,
+            'nickname': nickname or str(uid)
+        })
+    return history
 
 def place_bid(uid, auction_id, amount):
     auction = get_auction(auction_id)
@@ -1795,6 +1838,7 @@ def place_bid(uid, auction_id, amount):
 
     current_price = auction['current_price']
     current_bidder = auction['current_bidder_id']
+    min_increment = auction.get('min_increment', 0)
 
     if current_bidder is None:
         if amount < auction['starting_price']:
@@ -1802,6 +1846,8 @@ def place_bid(uid, auction_id, amount):
     else:
         if amount <= current_price:
             return False, f"出价必须高于当前价格 {current_price} 学分"
+        if min_increment > 0 and (amount - current_price) < min_increment:
+            return False, f"每次加价至少 {min_increment} 学分"
 
     balance = get_coins(uid)
     if balance < amount:
@@ -1879,9 +1925,46 @@ def cancel_auction(auction_id):
         conn.commit()
     return True, f"竞拍 #{auction_id} 已取消，{f'已退还 {current_price} 学分给出价人' if current_bidder else '无出价记录'}"
 
+# ---------- 格式化美化竞拍信息 ----------
+def format_auction_full(auction):
+    """生成单个竞拍的详细美观文本（包含10条出价记录）"""
+    lines = []
+    lines.append(f"🏷️ **同学会拍卖第{auction['id']}期**  截止: {auction['end_time'].strftime('%Y-%m-%d %H:%M')}")
+    lines.append(f"📌 标题：{auction['description'] or '无'}")
+    lines.append(f"📦 商品：{auction['item_name']}")
+    lines.append(f"💰 起拍价：{auction['starting_price']} 学分")
+    if auction.get('min_increment', 0) > 0:
+        lines.append(f"📈 最小加价：{auction['min_increment']} 学分")
+    lines.append(f"💎 当前价：{auction['current_price']} 学分")
+
+    # 最高价出价人
+    bidder_id = auction['current_bidder_id']
+    if bidder_id:
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT nickname FROM users WHERE user_id=?", (bidder_id,))
+            row = c.fetchone()
+            name = row[0] if row else str(bidder_id)
+        lines.append(f"👑 最高价：<a href='tg://user?id={bidder_id}'>{name}</a>")
+    else:
+        lines.append("👑 最高价：暂无")
+
+    # 出价记录
+    history = get_bid_history(auction['id'], limit=10)
+    if history:
+        lines.append("📜 **出价记录（最近10条）**：")
+        for idx, rec in enumerate(history, 1):
+            user_link = f"<a href='tg://user?id={rec['user_id']}'>{rec['nickname']}</a>"
+            time_str = rec['time'].strftime('%m-%d %H:%M')
+            lines.append(f"  {idx}. {user_link} 出价 {rec['amount']} 学分  ({time_str})")
+    else:
+        lines.append("📜 暂无出价记录")
+
+    return "\n".join(lines)
+
 # ---------- 竞拍命令 ----------
 async def cmd_jp(update, ctx):
-    """私聊管理员创建竞拍：/jp <标题> <商品> <起拍价> <结束时间>"""
+    """私聊管理员创建竞拍：/jp <标题> <商品> <起拍价> <结束时间> [-j 最小加价]"""
     if update.effective_chat.type != 'private':
         return
     if update.effective_user.id not in ADMIN_IDS:
@@ -1889,25 +1972,49 @@ async def cmd_jp(update, ctx):
         return
 
     args = ctx.args
-    if len(args) < 5:  # 至少需要：标题 商品 起拍价 日期 时间
+    if len(args) < 5:
         await update.message.reply_text(
-            "用法：/jp <标题> <商品> <起拍价> <结束时间>\n"
-            "结束时间格式必须为：YYYY-MM-DD HH:MM（例如 2026-09-06 09:10）\n"
-            "示例：/jp 八月福利 限量手办 100 2026-09-07 20:00"
+            "用法：/jp <标题> <商品> <起拍价> <结束时间> [-j 最小加价]\n"
+            "结束时间格式：YYYY-MM-DD HH:MM\n"
+            "示例：/jp 八月惊喜 手办 100 2026-09-08 07:30 -j 10"
         )
         return
 
-    # 起拍价是倒数第三个参数（最后两个是日期和时间）
+    # 解析 -j 参数
+    min_increment = 0
+    clean_args = []
+    i = 0
+    while i < len(args):
+        if args[i] == '-j':
+            if i + 1 < len(args):
+                try:
+                    min_increment = float(args[i+1])
+                    if min_increment < 0:
+                        min_increment = 0
+                    i += 2
+                    continue
+                except ValueError:
+                    pass
+            await update.message.reply_text("❌ -j 参数后必须跟正数")
+            return
+        clean_args.append(args[i])
+        i += 1
+
+    if len(clean_args) < 4:
+        await update.message.reply_text("参数不足，请检查格式。")
+        return
+
+    # 起拍价是倒数第三个（最后两个是日期和时间）
     try:
-        starting_price = float(args[-3])
+        starting_price = float(clean_args[-3])
         if starting_price <= 0:
             raise ValueError
     except ValueError:
         await update.message.reply_text("起拍价必须为正数数字。")
         return
 
-    # 合并最后两个参数为完整时间字符串
-    time_str = args[-2] + ' ' + args[-1]
+    # 合并最后两个参数为完整时间
+    time_str = clean_args[-2] + ' ' + clean_args[-1]
     try:
         end_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
     except ValueError:
@@ -1917,71 +2024,60 @@ async def cmd_jp(update, ctx):
         await update.message.reply_text(f"结束时间必须在未来。当前时间：{now_cn().strftime('%Y-%m-%d %H:%M')}")
         return
 
-    # 标题为第一个参数，商品为中间部分（从第二个到倒数第四个）
-    title = args[0]
-    item_name = ' '.join(args[1:-3]) if len(args) > 4 else "未命名商品"
+    # 标题和商品
+    title = clean_args[0]
+    item_name = ' '.join(clean_args[1:-3]) if len(clean_args) > 4 else "未命名商品"
 
     try:
-        auction_id = create_auction(update.effective_user.id, item_name, title, starting_price, end_time)
+        auction_id = create_auction(update.effective_user.id, item_name, title, starting_price, end_time, min_increment)
         await update.message.reply_text(
             f"✅ 竞拍创建成功！\n"
             f"ID: {auction_id}\n"
             f"标题：{title}\n"
             f"商品：{item_name}\n"
             f"起拍价：{starting_price} 学分\n"
+            f"最小加价：{min_increment} 学分\n"
             f"结束时间：{end_time.strftime('%Y-%m-%d %H:%M')}\n"
-            f"群组中使用 /竞拍 参与出价。"
+            f"群组中使用「竞拍」或「/竞拍」参与。"
         )
     except Exception as e:
         await update.message.reply_text(f"❌ 创建失败：{e}")
 
-# 注意：此函数用于处理 /竞拍 消息，由 MessageHandler 调用，因此不依赖 ctx.args
+# 统一的竞拍处理函数（同时支持 /竞拍 和 竞拍 前缀）
 async def cmd_bid_or_list(update, ctx):
-    """处理群组中 /竞拍 命令（无参数时列表，有参数时出价）"""
+    """处理群组中「竞拍」相关命令（无参列表，有参出价）"""
     if update.effective_chat.type not in ('group', 'supergroup'):
         return
     if update.effective_chat.id not in ALLOWED_GROUPS:
         await update.message.reply_text("该群组未授权使用本机器人。")
         return
 
-    # 从消息文本中提取参数（去掉命令本身）
     text = update.message.text.strip()
-    # 匹配 /竞拍 或 /竞拍@botusername
+    # 兼容 /竞拍 和 竞拍 两种前缀
     if text.startswith('/竞拍'):
-        parts = text.split()
-        # 去掉命令部分（可能包含 @）
-        if len(parts) > 0:
-            # 如果第一个词是 /竞拍 或 /竞拍@xxx，则移除
-            if parts[0].startswith('/竞拍'):
-                args = parts[1:]
-            else:
-                args = parts
-        else:
-            args = []
+        cmd_part = '/竞拍'
+    elif text.startswith('竞拍'):
+        cmd_part = '竞拍'
     else:
-        # 如果不是 /竞拍 开头，忽略（安全防护）
         return
 
-    # 无参数 → 列出所有进行中的竞拍详情
+    # 提取参数
+    parts = text.split()
+    if len(parts) > 0 and parts[0].startswith(cmd_part):
+        args = parts[1:]
+    else:
+        args = []
+
+    # 无参数 → 列出所有进行中的竞拍详情（美化UI）
     if not args:
         auctions = list_active_auctions()
         if not auctions:
             await update.message.reply_text("当前没有进行中的竞拍。")
             return
-        msg = "📢 进行中的竞拍：\n"
+        # 每个竞拍显示完整信息
         for a in auctions:
-            bidder_id = a['current_bidder_id']
-            with db_connect() as conn:
-                c = conn.cursor()
-                c.execute("SELECT nickname FROM users WHERE user_id=?", (bidder_id,))
-                row = c.fetchone()
-                bidder_name = row[0] if row else (str(bidder_id) if bidder_id else "暂无")
-            end_time_str = a['end_time'].strftime('%Y-%m-%d %H:%M')
-            msg += (
-                f"ID:{a['id']} | {a['item_name']} | "
-                f"当前价:{a['current_price']} | 出价人:{bidder_name} | 截止:{end_time_str}\n"
-            )
-        await update.message.reply_text(msg)
+            detail = format_auction_full(a)
+            await update.message.reply_text(detail, parse_mode=ParseMode.HTML)
         return
 
     # 有参数 → 尝试出价
@@ -1989,7 +2085,6 @@ async def cmd_bid_or_list(update, ctx):
     name = update.effective_user.first_name
     get_user(uid, name)
 
-    # 判断参数数量
     if len(args) == 1:
         # 只有金额，自动选择最新（ID最大）进行中的竞拍
         amount_str = args[0]
@@ -2024,25 +2119,17 @@ async def cmd_bid_or_list(update, ctx):
             await update.message.reply_text("竞拍ID和金额必须为正数。")
             return
     else:
-        await update.message.reply_text("用法：/竞拍 <金额> 或 /竞拍 <竞拍ID> <金额>")
+        await update.message.reply_text("用法：竞拍 <金额> 或 竞拍 <竞拍ID> <金额>")
         return
 
     success, msg = place_bid(uid, auction_id, amount)
     await update.message.reply_text(msg)
     if success:
+        # 出价成功后，重新显示该竞拍的完整信息
         auction = get_auction(auction_id)
         if auction:
-            bidder_id = auction['current_bidder_id']
-            with db_connect() as conn:
-                c = conn.cursor()
-                c.execute("SELECT nickname FROM users WHERE user_id=?", (bidder_id,))
-                row = c.fetchone()
-                bidder_name = row[0] if row else str(bidder_id)
-            end_time_str = auction['end_time'].strftime('%Y-%m-%d %H:%M')
-            await update.message.reply_text(
-                f"当前最高价：{auction['current_price']} 学分，出价人：{bidder_name}\n"
-                f"结束时间：{end_time_str}"
-            )
+            detail = format_auction_full(auction)
+            await update.message.reply_text(detail, parse_mode=ParseMode.HTML)
 
 async def cmd_qxpm(update, ctx):
     """私聊管理员取消竞拍：/qxpm <竞拍ID>"""
@@ -2117,10 +2204,11 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r'^骰子战绩$'), dice_stats))
     app.add_handler(CommandHandler("dice_stats", dice_stats))
 
-    # ========== 竞拍命令（必须放在 on_msg 之前，避免被拦截） ==========
+    # ========== 竞拍命令（支持 /竞拍 和 竞拍 两种，由同一个处理函数处理） ==========
+    # 注意：/竞拍 必须放在 on_msg 之前，避免被拦截；纯文本“竞拍”由 on_msg 内处理
     app.add_handler(MessageHandler(filters.Regex(r'^/竞拍\b'), cmd_bid_or_list))
 
-    # ========== 通用消息处理器（处理非命令文本） ==========
+    # ========== 通用消息处理器（处理非命令文本，包括纯文本“竞拍”） ==========
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_msg))
 
     app.add_handler(CallbackQueryHandler(cb))
@@ -2136,7 +2224,7 @@ def main():
     app.add_handler(CommandHandler("ql", cmd_clean_lottery))
     app.add_handler(CommandHandler("sb", cmd_remove_user_lottery))
 
-    # ========== 竞拍其他命令 ==========
+    # ========== 竞拍其他命令（私聊） ==========
     app.add_handler(CommandHandler("jp", cmd_jp, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("qxpm", cmd_qxpm, filters=filters.ChatType.PRIVATE))
 
