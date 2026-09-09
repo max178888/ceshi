@@ -1210,7 +1210,8 @@ async def cmd_start(update, ctx):
                 "\n群组命令（支持 /竞拍 或 竞拍）：\n"
                 "竞拍 - 列出所有进行中的竞拍详情\n"
                 "竞拍 <金额> - 对最新竞拍出价\n"
-                "竞拍 <ID> <金额> - 对指定竞拍出价"
+                "竞拍 <ID> <金额> - 对指定竞拍出价\n"
+                "回复机器人发出的竞拍消息并输入数字，可直接对该竞拍出价"
             )
             await update.message.reply_text(help_text)
         else:
@@ -1264,14 +1265,39 @@ async def on_msg(update, ctx):
         if update.effective_chat.id not in ALLOWED_GROUPS:
             return
     text = update.message.text.strip()
+
+    # ---------- 检测回复竞拍消息 ----------
+    if update.message.reply_to_message:
+        replied = update.message.reply_to_message
+        if replied.from_user and replied.from_user.is_bot:
+            # 检查被回复消息是否包含竞拍信息（名称已改为“苏大拍卖”）
+            if "拍卖第" in replied.text:
+                match = re.search(r'拍卖第(\d+)期', replied.text)
+                if match:
+                    auction_id = int(match.group(1))
+                    reply_text = update.message.text.strip()
+                    num_match = re.search(r'(\d+(?:\.\d+)?)', reply_text)
+                    if num_match:
+                        amount = float(num_match.group(1))
+                        if amount > 0:
+                            uid = update.effective_user.id
+                            name = update.effective_user.first_name
+                            get_user(uid, name)
+                            success, msg = place_bid(uid, auction_id, amount)
+                            await update.message.reply_text(msg)
+                            if success:
+                                auction = get_auction(auction_id)
+                                if auction:
+                                    detail = format_auction_full(auction)
+                                    await update.message.reply_text(detail, parse_mode=ParseMode.HTML)
+                            return  # 已处理，不再继续
+
     # 跳过以 / 开头的命令（但保留 /竞拍 已在外部处理）
     if text.startswith('/'):
         return
 
     # ---------- 处理不带斜杠的“竞拍”命令 ----------
     if text == "竞拍" or text.startswith("竞拍 "):
-        # 构造一个模拟的 /竞拍 消息，让 cmd_bid_or_list 处理
-        # 直接调用并传入 update, ctx，该函数会从 update.message.text 解析
         await cmd_bid_or_list(update, ctx)
         return
 
@@ -1505,7 +1531,8 @@ async def on_msg(update, ctx):
         rid = round_id
         bet_example = "押 大 10  押 小 10  押大双 10"
         status = "🟢投注中"
-        msg = f"🎲同学会骰王 {date_str} 第{rid}期\n"
+        # 名称改为“苏大骰王”
+        msg = f"🎲苏大骰王 {date_str} 第{rid}期\n"
         msg += f"💡状态：    {status}\n"
         msg += f"⏰️距离开奖:{remaining_seconds}秒\n"
         msg += f"💰投注格式：{bet_example}"
@@ -1611,7 +1638,8 @@ async def settle_round(context, rid, chat_id):
             c = conn.cursor()
             c.execute("UPDATE dice_rounds SET end_time=?, numbers='', total=0, result='无人下注', total_bets=0 WHERE id=?", (now_cn(), rid))
             conn.commit()
-        await context.bot.send_message(chat_id=chat_id, text=f"🎲 同学会骰王 第{rid}期 无人下注，已结束。")
+        # 名称改为“苏大骰王”
+        await context.bot.send_message(chat_id=chat_id, text=f"🎲 苏大骰王 第{rid}期 无人下注，已结束。")
         with db_connect() as conn:
             c = conn.cursor()
             c.execute("DELETE FROM dice_bets WHERE round_id = ?", (rid,))
@@ -1655,7 +1683,8 @@ async def settle_round(context, rid, chat_id):
             update_bet_win(rid, uid, 0.0)
     close_round(rid, '-'.join(map(str, numbers)), total, result_combined, len(bets))
     date_str = now_cn().strftime('%m月%d日')
-    result_msg = f"<b>🎲 同学会骰王  {date_str} 第{rid}期 开奖结果</b>\n"
+    # 名称改为“苏大骰王”
+    result_msg = f"<b>🎲 苏大骰王  {date_str} 第{rid}期 开奖结果</b>\n"
     result_msg += f"🎯号码：{' + '.join(map(str, numbers))} = {total}\n"
     result_msg += f"📋结果：<b>{result_combined}</b>\n\n"
     if winners:
@@ -1931,9 +1960,9 @@ def cancel_auction(auction_id):
 
 # ---------- 格式化美化竞拍信息 ----------
 def format_auction_full(auction):
-    """生成单个竞拍的详细美观文本（包含10条出价记录）"""
+    """生成单个竞拍的详细美观文本（包含10条出价记录），名称改为“苏大拍卖”"""
     lines = []
-    lines.append(f"🏷️ **同学会拍卖第{auction['id']}期**  截止: {auction['end_time'].strftime('%Y-%m-%d %H:%M')}")
+    lines.append(f"🏷️ **苏大拍卖第{auction['id']}期**  截止: {auction['end_time'].strftime('%Y-%m-%d %H:%M')}")
     lines.append(f"📌 标题：{auction['description'] or '无'}")
     lines.append(f"📦 商品：{auction['item_name']}")
     lines.append(f"💰 起拍价：{auction['starting_price']} 学分")
@@ -2264,7 +2293,7 @@ def main():
     # ========== 竞拍其他命令（私聊） ==========
     app.add_handler(CommandHandler("jp", cmd_jp, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("qxpm", cmd_qxpm, filters=filters.ChatType.PRIVATE))
-    app.add_handler(CommandHandler("jplist", cmd_jplist, filters=filters.ChatType.PRIVATE))  # 新增
+    app.add_handler(CommandHandler("jplist", cmd_jplist, filters=filters.ChatType.PRIVATE))
 
     app.run_polling(allowed_updates=["message", "callback_query"])
 
