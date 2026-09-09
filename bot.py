@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TG 打卡上班机器人 - 增强版（单个用户有效期）
-新增：
-- 管理员可为单个老师设置有效期（天数），到期后该老师无法开课
-- 开课过期时，仅在私聊中通知该老师，群内静默
+TG 打卡上班机器人 - 完整增强版
+功能：
+- 开课/下课、出勤按钮、爱心反应、7天清理、管理员面板
+- 频道定时发送（湖州/嘉兴独立配置）
+- 个人有效期（管理员设置，超期私聊阻止开课）
 """
 
 import json
@@ -36,11 +37,11 @@ DATA_DIR = os.getenv("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 ACTIVE_FILE = os.path.join(DATA_DIR, "active.json")
-CONFIG_FILE = os.path.join(DATA_DIR, "config.json")   # 仍用于频道配置等
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 
+# 对话状态
 ADMIN_ADD_ID, ADMIN_ADD_NAME, ADMIN_ADD_REGION = range(1, 4)
-# 新增对话状态：设置用户有效期
-ADMIN_SET_EXPIRE_USER = 20
+ADMIN_SET_CHANNEL, ADMIN_SET_INTERVAL, ADMIN_SET_EXPIRE = range(10, 13)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -48,7 +49,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-logger.info(f"数据目录: {DATA_DIR}，用户文件: {USERS_FILE}，开课文件: {ACTIVE_FILE}")
+logger.info(f"数据目录: {DATA_DIR}")
 
 # ---------- 数据持久化 ----------
 def load_users() -> Dict[int, Dict]:
@@ -73,26 +74,26 @@ def save_active(active: Dict[int, Dict]):
     with open(ACTIVE_FILE, "w", encoding="utf-8") as f:
         json.dump(active, f, ensure_ascii=False, indent=2)
 
-# ---------- 配置管理（保留） ----------
 def load_config() -> Dict:
-    default_config = {
+    default = {
         "channel_b": {"chat_id": None, "interval_hours": 24, "enabled": False},
         "channel_c": {"chat_id": None, "interval_hours": 24, "enabled": False},
         "last_sent_b": None,
         "last_sent_c": None,
+        # 个人有效期存储格式: {"user_id": "2026-12-31T23:59:59+00:00"}
+        "user_expires": {}
     }
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             try:
-                config = json.load(f)
-                for key in default_config:
-                    if key not in config:
-                        config[key] = default_config[key]
-                return config
+                data = json.load(f)
+                for key in default:
+                    if key not in data:
+                        data[key] = default[key]
+                return data
             except:
-                return default_config
-    else:
-        return default_config
+                return default
+    return default
 
 def save_config(config: Dict):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -106,7 +107,6 @@ def reset_active_status():
         logger.info("定时任务：已清空所有开课状态")
 
 def cleanup_inactive_users():
-    # 保留7天未开课自动清理（原有逻辑不变）
     users = load_users()
     if not users:
         return
@@ -132,7 +132,6 @@ def cleanup_inactive_users():
         save_users(users)
         logger.info(f"清理了 {len(deleted)} 名连续7天未开课的老师，ID: {deleted}")
 
-# ---------- 辅助函数 ----------
 def get_user_info(user_id: int) -> Optional[Dict]:
     return load_users().get(user_id)
 
@@ -150,6 +149,11 @@ def delete_user_info(user_id: int):
         if user_id in active:
             del active[user_id]
             save_active(active)
+        # 同时清除有效期
+        config = load_config()
+        if str(user_id) in config.get("user_expires", {}):
+            del config["user_expires"][str(user_id)]
+            save_config(config)
 
 def get_attendance_buttons(region: str) -> Optional[InlineKeyboardMarkup]:
     users = load_users()
@@ -185,30 +189,6 @@ async def is_member_of_group_a(user_id: int, context: ContextTypes.DEFAULT_TYPE)
         logger.error(f"检查群A成员失败: {e}")
         return False
 
-# ---------- 新增：检查用户有效期 ----------
-async def check_user_expire(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """返回 True 表示有效（可以开课），False 表示已过期"""
-    user_info = get_user_info(user_id)
-    if not user_info:
-        return False  # 未登记视为无效
-    expire_days = user_info.get("expire_days")
-    if expire_days is None:
-        return True   # 未设置有效期，视为无限期
-    if expire_days <= 0:
-        return True   # 0 或负数视为无限期
-    # 检查是否超过有效期：基于 last_active 或登记日期？由于没有登记时间，我们使用 last_active（最近开课时间）。如果从未开课，则视为有效（不阻挡）。
-    last_active_str = user_info.get("last_active")
-    if not last_active_str:
-        return True   # 从未开课，视为有效（管理员可能刚设置有效期，但老师未开课，暂不限制）
-    try:
-        last_active = datetime.fromisoformat(last_active_str)
-    except:
-        return True
-    now = datetime.now(timezone.utc)
-    if (now - last_active).days >= expire_days:
-        return False
-    return True
-
 # ---------- 私聊 /start ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
@@ -222,12 +202,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_info = get_user_info(user_id)
     if user_info:
-        expire_days = user_info.get("expire_days")
-        if expire_days is not None and expire_days > 0:
-            expire_info = f" (有效期 {expire_days} 天)"
-        else:
-            expire_info = " (无限期)"
-        text = f"✅ 已登记：{user_info['name']}（{user_info['region']}同学会）{expire_info}"
+        text = f"✅ 已登记：{user_info['name']}（{user_info['region']}同学会）"
     else:
         text = "🤖 请完成登记"
 
@@ -257,25 +232,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("❌ 强制清空某个老师开课", callback_data="admin_clear_active")],
             [InlineKeyboardButton("🗑 删除登记老师", callback_data="admin_delete_user")],
             [InlineKeyboardButton("➕ 手动添加登记老师", callback_data="admin_add_user")],
-            # -------- 新增：设置用户有效期 ----------
-            [InlineKeyboardButton("⏰ 设置用户有效期", callback_data="admin_set_user_expire")],
-            # -----------------------------------------
             [InlineKeyboardButton("📡 设置湖州频道", callback_data="admin_set_channel_b")],
             [InlineKeyboardButton("📡 设置嘉兴频道", callback_data="admin_set_channel_c")],
+            [InlineKeyboardButton("⏰ 设置个人有效期", callback_data="admin_set_expire")],
             [InlineKeyboardButton("🔙 返回", callback_data="back_to_menu")],
         ]
         await query.edit_message_text("管理员面板：", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # -------- 新增：设置用户有效期 ----------
-    if data == "admin_set_user_expire":
-        if user_id not in ADMIN_IDS:
-            return
-        await query.edit_message_text("请输入老师的用户ID（数字）：")
-        context.user_data["admin_set_expire_step"] = "id"
-        return
-
-    # -------- 频道设置（保留） ----------
+    # 设置频道
     if data in ["admin_set_channel_b", "admin_set_channel_c"]:
         if user_id not in ADMIN_IDS:
             return
@@ -285,7 +250,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["admin_set_step"] = ADMIN_SET_CHANNEL
         return
 
-    # 原有回调处理...
+    # 设置个人有效期
+    if data == "admin_set_expire":
+        if user_id not in ADMIN_IDS:
+            return
+        await query.edit_message_text("请输入要设置有效期的老师ID（数字）：")
+        context.user_data["admin_set_step"] = ADMIN_SET_EXPIRE
+        return
+
+    # 原有回调
     if data == "admin_add_user":
         if user_id not in ADMIN_IDS:
             return
@@ -303,9 +276,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = ["已登记老师列表："]
         for uid, info in users.items():
             last_active = info.get("last_active", "从未开课")
-            expire = info.get("expire_days")
-            expire_str = f"有效期{expire}天" if expire and expire > 0 else "无限期"
-            lines.append(f"{uid} | {info['name']} | {info['region']} | {expire_str} | 最后活跃: {last_active}")
+            lines.append(f"{uid} | {info['name']} | {info['region']} | 最后活跃: {last_active}")
         text = "\n".join(lines)
         if len(text) > 4000:
             await query.edit_message_text("列表过长，请查看日志")
@@ -379,18 +350,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         active = load_active()
         status = "🟢 开课中" if user_id in active else "🔴 未开课"
-        expire = user_info.get("expire_days")
-        expire_str = f"有效期{expire}天" if expire and expire > 0 else "无限期"
-        text = f"昵称：{user_info['name']}\n地区：{user_info['region']}同学会\n状态：{status}\n{expire_str}"
+        # 显示有效期（如果有）
+        config = load_config()
+        expire_str = config.get("user_expires", {}).get(str(user_id))
+        if expire_str:
+            try:
+                expire_dt = datetime.fromisoformat(expire_str)
+                if expire_dt > datetime.now(timezone.utc):
+                    status += f"\n⏰ 有效期至: {expire_dt.strftime('%Y-%m-%d %H:%M')}"
+                else:
+                    status += "\n⛔ 已过期（请联系管理员续期）"
+            except:
+                pass
+        text = f"昵称：{user_info['name']}\n地区：{user_info['region']}同学会\n状态：{status}"
         await query.edit_message_text(text)
         return
 
     if data == "back_to_menu":
         user_info = get_user_info(user_id)
         if user_info:
-            expire = user_info.get("expire_days")
-            expire_str = f" (有效期{expire}天)" if expire and expire > 0 else " (无限期)"
-            text = f"✅ 已登记：{user_info['name']}（{user_info['region']}同学会）{expire_str}"
+            text = f"✅ 已登记：{user_info['name']}（{user_info['region']}同学会）"
         else:
             text = "🤖 请完成登记"
         keyboard = [
@@ -410,29 +389,80 @@ async def private_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
-    # -------- 新增：设置用户有效期流程 ----------
-    step = context.user_data.get("admin_set_expire_step")
-    if step == "id":
-        if user_id not in ADMIN_IDS:
-            await update.message.reply_text("无权操作")
+    # ----- 设置频道 Chat ID -----
+    if context.user_data.get("admin_set_step") == ADMIN_SET_CHANNEL:
+        channel = context.user_data.get("set_channel")
+        if not channel:
+            await update.message.reply_text("会话已过期，请重新开始")
             return
+        try:
+            chat_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 请输入有效的数字 Chat ID：")
+            return
+        # 保存 Chat ID
+        config = load_config()
+        if channel == "b":
+            config["channel_b"]["chat_id"] = chat_id
+            config["channel_b"]["enabled"] = True
+        else:
+            config["channel_c"]["chat_id"] = chat_id
+            config["channel_c"]["enabled"] = True
+        save_config(config)
+        await update.message.reply_text(f"✅ 已设置 {channel.upper()} 频道 Chat ID: {chat_id}\n接下来请设置发送间隔（小时数）：")
+        # 切换到间隔设置状态
+        context.user_data["admin_set_step"] = ADMIN_SET_INTERVAL
+        return
+
+    # ----- 设置发送间隔 -----
+    if context.user_data.get("admin_set_step") == ADMIN_SET_INTERVAL:
+        channel = context.user_data.get("set_channel")
+        if not channel:
+            await update.message.reply_text("会话已过期，请重新开始")
+            return
+        try:
+            interval = float(text)
+            if interval <= 0:
+                raise ValueError
+        except:
+            await update.message.reply_text("❌ 请输入正数（小时），例如 24")
+            return
+        config = load_config()
+        if channel == "b":
+            config["channel_b"]["interval_hours"] = interval
+            config["last_sent_b"] = None
+        else:
+            config["channel_c"]["interval_hours"] = interval
+            config["last_sent_c"] = None
+        save_config(config)
+        await update.message.reply_text(f"✅ 设置完成！每隔 {interval} 小时自动发送出勤到 {channel.upper()} 频道。")
+        context.user_data.pop("admin_set_step", None)
+        context.user_data.pop("set_channel", None)
+        return
+
+    # ----- 设置个人有效期（输入用户ID）-----
+    if context.user_data.get("admin_set_step") == ADMIN_SET_EXPIRE:
         try:
             target_id = int(text)
         except ValueError:
-            await update.message.reply_text("❌ 请输入数字ID：")
+            await update.message.reply_text("❌ 请输入有效的数字ID：")
             return
-        user_info = get_user_info(target_id)
-        if not user_info:
-            await update.message.reply_text(f"❌ 用户 {target_id} 未登记")
-            context.user_data.pop("admin_set_expire_step", None)
+        if not get_user_info(target_id):
+            await update.message.reply_text(f"⚠️ 老师 ID {target_id} 未登记，请先添加老师。")
+            context.user_data.pop("admin_set_step", None)
             return
-        context.user_data["admin_set_expire_target"] = target_id
-        context.user_data["admin_set_expire_step"] = "days"
-        await update.message.reply_text(f"为 {user_info['name']} (ID:{target_id}) 设置有效期天数（输入0表示无限期）：")
+        context.user_data["expire_target"] = target_id
+        await update.message.reply_text("请输入有效期天数（例如 30，输入 0 表示无限期）：")
+        context.user_data["admin_set_step"] = ADMIN_SET_INTERVAL  # 重用间隔状态，但含义不同，实际为有效期天数
+        # 改变标志以免混淆
+        context.user_data["expire_days_mode"] = True
         return
 
-    if step == "days":
-        if user_id not in ADMIN_IDS:
+    # ----- 接收有效期天数 -----
+    if context.user_data.get("admin_set_step") == ADMIN_SET_INTERVAL and context.user_data.get("expire_days_mode"):
+        target_id = context.user_data.get("expire_target")
+        if not target_id:
+            await update.message.reply_text("会话已过期，请重新开始")
             return
         try:
             days = int(text)
@@ -441,24 +471,27 @@ async def private_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         except:
             await update.message.reply_text("❌ 请输入非负整数（0 表示无限期）：")
             return
-        target_id = context.user_data.get("admin_set_expire_target")
-        if not target_id:
-            await update.message.reply_text("会话已过期，请重新操作")
-            context.user_data.pop("admin_set_expire_step", None)
-            return
-        # 更新用户信息
-        users = load_users()
-        if target_id in users:
-            users[target_id]["expire_days"] = days
-            save_users(users)
-            await update.message.reply_text(f"✅ 已为 {users[target_id]['name']} (ID:{target_id}) 设置有效期 {days} 天{'（无限期）' if days == 0 else ''}")
+        config = load_config()
+        if days == 0:
+            # 清除有效期
+            if str(target_id) in config.get("user_expires", {}):
+                del config["user_expires"][str(target_id)]
+                save_config(config)
+            await update.message.reply_text(f"✅ 已取消老师 {target_id} 的有效期限制（无限期）。")
         else:
-            await update.message.reply_text(f"❌ 用户 {target_id} 不存在")
-        context.user_data.pop("admin_set_expire_target", None)
-        context.user_data.pop("admin_set_expire_step", None)
+            expire_time = datetime.now(timezone.utc) + timedelta(days=days)
+            expire_str = expire_time.isoformat()
+            if "user_expires" not in config:
+                config["user_expires"] = {}
+            config["user_expires"][str(target_id)] = expire_str
+            save_config(config)
+            await update.message.reply_text(f"✅ 老师 {target_id} 的有效期已设置为 {days} 天，到期时间为 {expire_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        context.user_data.pop("admin_set_step", None)
+        context.user_data.pop("expire_target", None)
+        context.user_data.pop("expire_days_mode", None)
         return
 
-    # -------- 原有管理员添加老师 ----------
+    # ----- 原有管理员添加老师 ----------
     step = context.user_data.get("admin_add_step")
     if step == ADMIN_ADD_ID:
         try:
@@ -489,55 +522,7 @@ async def private_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("请选择该老师的地区：", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # -------- 频道设置（保留） ----------
-    if context.user_data.get("admin_set_step") == ADMIN_SET_CHANNEL:
-        channel = context.user_data.get("set_channel")
-        if not channel:
-            await update.message.reply_text("会话已过期，请重新开始")
-            return
-        try:
-            chat_id = int(text)
-        except ValueError:
-            await update.message.reply_text("❌ 请输入有效的数字 Chat ID：")
-            return
-        config = load_config()
-        if channel == "b":
-            config["channel_b"]["chat_id"] = chat_id
-            config["channel_b"]["enabled"] = True
-        else:
-            config["channel_c"]["chat_id"] = chat_id
-            config["channel_c"]["enabled"] = True
-        save_config(config)
-        await update.message.reply_text(f"✅ 已设置 {channel.upper()} 频道 Chat ID: {chat_id}\n接下来请设置发送间隔（小时数）：")
-        context.user_data["admin_set_step"] = ADMIN_SET_INTERVAL
-        return
-
-    if context.user_data.get("admin_set_step") == ADMIN_SET_INTERVAL:
-        channel = context.user_data.get("set_channel")
-        if not channel:
-            await update.message.reply_text("会话已过期，请重新开始")
-            return
-        try:
-            interval = float(text)
-            if interval <= 0:
-                raise ValueError
-        except:
-            await update.message.reply_text("❌ 请输入正数（小时），例如 24")
-            return
-        config = load_config()
-        if channel == "b":
-            config["channel_b"]["interval_hours"] = interval
-            config["last_sent_b"] = None
-        else:
-            config["channel_c"]["interval_hours"] = interval
-            config["last_sent_c"] = None
-        save_config(config)
-        await update.message.reply_text(f"✅ 设置完成！每隔 {interval} 小时自动发送出勤到 {channel.upper()} 频道。")
-        context.user_data.pop("admin_set_step", None)
-        context.user_data.pop("set_channel", None)
-        return
-
-    # -------- 原有管理员强制下课 ----------
+    # ----- 原有管理员强制下课 ----------
     if context.user_data.get("admin_clear_target"):
         try:
             target_id = int(text)
@@ -555,7 +540,7 @@ async def private_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.pop("admin_clear_target", None)
         return
 
-    # -------- 原有管理员删除老师 ----------
+    # ----- 原有管理员删除老师 ----------
     if context.user_data.get("admin_delete_target"):
         try:
             target_id = int(text)
@@ -572,7 +557,7 @@ async def private_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.pop("admin_delete_target", None)
         return
 
-    # -------- 原有普通用户设置昵称 ----------
+    # ----- 原有普通用户设置昵称 ----------
     if context.user_data.get("awaiting_name"):
         if not await is_member_of_group_a(user_id, context):
             await update.message.reply_text("❌ 您未加入开课群，无法设置昵称。")
@@ -643,26 +628,27 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
-        # 处理开课/下课
+        # 检查个人有效期（仅针对开课命令）
         if text == "开课":
-            # 检查有效期
-            if not await check_user_expire(user_id, context):
-                # 已过期：私聊通知，群内静默
+            config = load_config()
+            expire_str = config.get("user_expires", {}).get(str(user_id))
+            if expire_str:
                 try:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=f"⏰ 您 ({user_info['name']}) 的登记有效期已过，无法开课。请联系管理员续期。"
-                    )
-                except Exception as e:
-                    logger.error(f"无法私聊通知用户 {user_id}: {e}")
-                # 群内不回复，静默忽略
-                return
+                    expire_dt = datetime.fromisoformat(expire_str)
+                    if datetime.now(timezone.utc) >= expire_dt:
+                        # 已过期，私聊通知，群内无任何提示
+                        await update.message.reply_text("⛔ 您的登记已过期，请联系管理员续期。")
+                        logger.info(f"用户 {user_info['name']} (ID:{user_id}) 尝试开课但已过期，已私聊通知")
+                        return
+                except:
+                    pass
 
-            active = load_active()
+        # 已登记，处理开课/下课
+        active = load_active()
+        if text == "开课":
             if user_id in active:
                 await update.message.reply_text("已在开课中")
                 return
-            # 更新最后活跃时间
             user_info["last_active"] = datetime.now(timezone.utc).isoformat()
             users = load_users()
             users[user_id] = user_info
@@ -675,9 +661,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             save_active(active)
             await update.message.reply_text(f"✅ {user_info['name']} 开课成功 🟢")
             return
-
         elif text == "下课":
-            active = load_active()
             if user_id not in active:
                 await update.message.reply_text("未开课")
                 return
@@ -722,29 +706,36 @@ async def auto_heart_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.error(f"加心失败: {e}")
 
-# ---------- 频道定时发送（保留） ----------
+# ---------- 定时发送到频道 ----------
 async def send_attendance_to_channel(bot, region: str, channel_key: str):
     config = load_config()
-    channel_config = config[f"channel_{channel_key}"]
-    if not channel_config.get("enabled") or not channel_config.get("chat_id"):
+    ch_cfg = config[f"channel_{channel_key}"]
+    if not ch_cfg.get("enabled") or not ch_cfg.get("chat_id"):
+        logger.error(f"错误：{region} 频道未设置或未启用")
         return
-    chat_id = channel_config["chat_id"]
+    chat_id = ch_cfg["chat_id"]
     keyboard = get_attendance_buttons(region)
     if not keyboard:
         text = f"📭 {region}同学会当前暂无登记老师。"
+        try:
+            await bot.send_message(chat_id=chat_id, text=text)
+        except Exception as e:
+            logger.error(f"发送 {region} 出勤到频道失败: {e}")
     else:
-        text = f"📢 {region}同学会定时出勤报告："
-    try:
-        await bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
-        logger.info(f"已发送 {region} 出勤到频道 {chat_id}")
-        config[f"last_sent_{channel_key}"] = datetime.now(timezone.utc).isoformat()
-        save_config(config)
-    except Exception as e:
-        logger.error(f"发送 {region} 出勤到频道失败: {e}")
+        try:
+            await bot.send_message(chat_id=chat_id, text=f"📢 {region}同学会定时出勤报告：", reply_markup=keyboard)
+            logger.info(f"已发送 {region} 出勤到频道 {chat_id}")
+            # 更新最后发送时间
+            config[f"last_sent_{channel_key}"] = datetime.now(timezone.utc).isoformat()
+            save_config(config)
+        except Exception as e:
+            logger.error(f"发送 {region} 出勤到频道失败: {e}")
 
+# ---------- 后台任务 ----------
 async def scheduled_tasks(app):
     while True:
         try:
+            # 1. 发送出勤到频道
             config = load_config()
             now = datetime.now(timezone.utc)
             for key, region in [("b", "湖州"), ("c", "嘉兴")]:
@@ -762,11 +753,14 @@ async def scheduled_tasks(app):
                     last_sent = None
                 if not last_sent or (now - last_sent).total_seconds() >= interval * 3600:
                     await send_attendance_to_channel(app.bot, region, key)
+
+            # 2. 个人有效期自动检查（不删除，只做提醒？但此处不额外处理，已在开课时检查）
+            # 可选择每天发一次过期提醒，但暂不实现。
         except Exception as e:
             logger.error(f"定时任务异常: {e}")
         await asyncio.sleep(60)
 
-# ---------- 原有每日重置任务 ----------
+# ---------- 每日重置任务 ----------
 async def daily_reset_job():
     RESET_HOUR = 4
     RESET_MINUTE = 48
