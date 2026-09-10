@@ -1,806 +1,2299 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-TG 打卡上班机器人 - 完整增强版
-功能：
-- 开课/下课、出勤按钮、爱心反应、7天清理、管理员面板
-- 频道定时发送（湖州/嘉兴独立配置）
-- 个人有效期（管理员设置，超期私聊阻止开课）
-"""
-
-import json
 import os
-import logging
+import random
+import sqlite3
+import re
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, List
+from telegram import Update, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup
+from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, constants
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
-    ContextTypes,
-)
+# ========== 中国时区 ==========
+CHINA_TZ = timezone(timedelta(hours=8))
+def now_cn():
+    return datetime.now(CHINA_TZ).replace(tzinfo=None)
 
-# ==================== 配置 ====================
-BOT_TOKEN = "8179579064:AAF57RUAH5TVtrW4qdA4_wIAtWkRAAkqkvo"
-GROUP_A_CHAT_ID = -1003689306909
-GROUP_B_CHAT_ID = -1003002241602
-GROUP_C_CHAT_ID = -1003745425265
-ADMIN_IDS = {8354445328, 877039616, 42438298, 34415852}
-# ============================================
+# ========== 配置 ==========
+TOKEN = "8179579064:AAF57RUAH5TVtrW4qdA4_wIAtWkRAAkqkvo"   # 请替换为你的Token
+ALLOWED_GROUPS = [-1003002241602, -1003745425265, -1003720878201]  # 替换为你的群组ID
+ADMIN_IDS = [8354445328, 877039616, 42438298]  # 替换为管理员ID
 
-DATA_DIR = os.getenv("DATA_DIR", "/data")
-os.makedirs(DATA_DIR, exist_ok=True)
-USERS_FILE = os.path.join(DATA_DIR, "users.json")
-ACTIVE_FILE = os.path.join(DATA_DIR, "active.json")
-CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+BASE_DROP_PROB = 0.14
+TRIPLE_MULTIPLIER = 3
+DB_PATH = "/data/credits.db"
 
-# 对话状态
-ADMIN_ADD_ID, ADMIN_ADD_NAME, ADMIN_ADD_REGION = range(1, 4)
-ADMIN_SET_CHANNEL, ADMIN_SET_INTERVAL, ADMIN_SET_EXPIRE = range(10, 13)
+SHOP = [
+    (1, "100元福利券", 500),
+    (2, "3个月TG会员", 1000),
+    (3, "琪琪半价券", 500),
+]
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+INTERVALS = [
+    (0.60, 0.01, 0.3),
+    (0.185, 0.3, 0.6),
+    (0.05, 0.6, 0.8),
+    (0.05, 0.8, 1.0),
+    (0.05, 1.0, 2.0),
+    (0.05, 2.0, 4.0),
+    (0.01, 4.0, 6.0),
+    (0.005, 6.0, 8.0),
+]
 
-logger.info(f"数据目录: {DATA_DIR}")
+def rand_coin():
+    r = random.random()
+    cum = 0.0
+    for prob, low, high in INTERVALS:
+        cum += prob
+        if r <= cum:
+            return round(random.uniform(low, high), 2)
+    return round(random.uniform(0, 8), 2)
 
-# ---------- 数据持久化 ----------
-def load_users() -> Dict[int, Dict]:
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return {int(k): v for k, v in data.items()}
-    return {}
-
-def save_users(users: Dict[int, Dict]):
-    with open(USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(users, f, ensure_ascii=False, indent=2)
-
-def load_active() -> Dict[int, Dict]:
-    if os.path.exists(ACTIVE_FILE):
-        with open(ACTIVE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return {int(k): v for k, v in data.items()}
-    return {}
-
-def save_active(active: Dict[int, Dict]):
-    with open(ACTIVE_FILE, "w", encoding="utf-8") as f:
-        json.dump(active, f, ensure_ascii=False, indent=2)
-
-def load_config() -> Dict:
-    default = {
-        "channel_b": {"chat_id": None, "interval_hours": 24, "enabled": False},
-        "channel_c": {"chat_id": None, "interval_hours": 24, "enabled": False},
-        "last_sent_b": None,
-        "last_sent_c": None,
-        # 个人有效期存储格式: {"user_id": "2026-12-31T23:59:59+00:00"}
-        "user_expires": {}
-    }
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            try:
-                data = json.load(f)
-                for key in default:
-                    if key not in data:
-                        data[key] = default[key]
-                return data
-            except:
-                return default
-    return default
-
-def save_config(config: Dict):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
-
-# ---------- 原有函数 ----------
-def reset_active_status():
-    active = load_active()
-    if active:
-        save_active({})
-        logger.info("定时任务：已清空所有开课状态")
-
-def cleanup_inactive_users():
-    users = load_users()
-    if not users:
-        return
-    now = datetime.now(timezone.utc)
-    deleted = []
-    for uid, info in users.items():
-        last_active_str = info.get("last_active")
-        if not last_active_str:
-            continue
-        try:
-            last_active = datetime.fromisoformat(last_active_str)
-        except:
-            continue
-        if (now - last_active).days >= 7:
-            deleted.append(uid)
-            active = load_active()
-            if uid in active:
-                del active[uid]
-                save_active(active)
-    if deleted:
-        for uid in deleted:
-            del users[uid]
-        save_users(users)
-        logger.info(f"清理了 {len(deleted)} 名连续7天未开课的老师，ID: {deleted}")
-
-def get_user_info(user_id: int) -> Optional[Dict]:
-    return load_users().get(user_id)
-
-def set_user_info(user_id: int, name: str, region: str):
-    users = load_users()
-    users[user_id] = {"name": name, "region": region}
-    save_users(users)
-
-def delete_user_info(user_id: int):
-    users = load_users()
-    if user_id in users:
-        del users[user_id]
-        save_users(users)
-        active = load_active()
-        if user_id in active:
-            del active[user_id]
-            save_active(active)
-        # 同时清除有效期
-        config = load_config()
-        if str(user_id) in config.get("user_expires", {}):
-            del config["user_expires"][str(user_id)]
-            save_config(config)
-
-def get_attendance_buttons(region: str) -> Optional[InlineKeyboardMarkup]:
-    users = load_users()
-    active = load_active()
-    region_users = {uid: info for uid, info in users.items() if info.get("region") == region}
-    if not region_users:
-        return None
-
-    active_list = []
-    rest_list = []
-    for uid, info in region_users.items():
-        if uid in active:
-            active_list.append((uid, info, active[uid].get("start_time", "")))
-        else:
-            rest_list.append((uid, info))
-    active_list.sort(key=lambda x: x[2])
-    rest_list.sort(key=lambda x: x[1]["name"])
-    sorted_items = [(uid, info) for uid, info, _ in active_list] + [(uid, info) for uid, info in rest_list]
-
-    buttons = []
-    for uid, info in sorted_items:
-        status = "🟢" if uid in active else "🔴"
-        button_text = f"{status} {info['name']}"
-        buttons.append(InlineKeyboardButton(button_text, url=f"tg://user?id={uid}"))
-    keyboard = [buttons[i:i+3] for i in range(0, len(buttons), 3)]
-    return InlineKeyboardMarkup(keyboard)
-
-async def is_member_of_group_a(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    try:
-        member = await context.bot.get_chat_member(chat_id=GROUP_A_CHAT_ID, user_id=user_id)
-        return member.status in ["creator", "administrator", "member"]
-    except Exception as e:
-        logger.error(f"检查群A成员失败: {e}")
-        return False
-
-# ---------- 私聊 /start ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        await update.message.reply_text("请私聊我使用 /start。")
-        return
-
-    user_id = update.effective_user.id
-    if not await is_member_of_group_a(user_id, context):
-        await update.message.reply_text("❌ 您尚未加入开课群，无法使用机器人。请先加入群A。")
-        return
-
-    user_info = get_user_info(user_id)
-    if user_info:
-        text = f"✅ 已登记：{user_info['name']}（{user_info['region']}同学会）"
+def get_dynamic_drop_prob(today_gain):
+    if today_gain >= 20:
+        return 0.02
+    elif today_gain >= 17:
+        return 0.055
+    elif today_gain >= 15:
+        return 0.065
+    elif today_gain >= 10:
+        return 0.11
     else:
-        text = "🤖 请完成登记"
+        return BASE_DROP_PROB
 
-    keyboard = [
-        [InlineKeyboardButton("📝 登记/修改昵称", callback_data="set_name")],
-        [InlineKeyboardButton("🌍 设置地区（湖州/嘉兴）", callback_data="set_region")],
-        [InlineKeyboardButton("👤 查看我的信息", callback_data="my_info")],
-    ]
-    if user_id in ADMIN_IDS:
-        keyboard.append([InlineKeyboardButton("🔧 管理员面板", callback_data="admin_panel")])
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+# ========== 数据库 ==========
+def db_connect():
+    return sqlite3.connect(DB_PATH)
 
-# ---------- 回调处理 ----------
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def init_db():
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("CREATE TABLE IF NOT EXISTS users (user_id INT PRIMARY KEY, nickname TEXT, coins REAL)")
+        c.execute("CREATE TABLE IF NOT EXISTS daily (user_id INT, date TEXT, gain REAL, PRIMARY KEY(user_id, date))")
+        c.execute("CREATE TABLE IF NOT EXISTS tx (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INT, type TEXT, amount REAL, desc TEXT, ts TIMESTAMP)")
+        c.execute("CREATE TABLE IF NOT EXISTS daily_first_bonus (user_id INT, date TEXT, used INT DEFAULT 0, PRIMARY KEY(user_id, date))")
+        c.execute("CREATE TABLE IF NOT EXISTS limited_purchases (user_id INT, item_id INT, PRIMARY KEY(user_id, item_id))")
+        c.execute("CREATE TABLE IF NOT EXISTS dice_rounds (id INTEGER PRIMARY KEY AUTOINCREMENT, start_time TIMESTAMP, end_time TIMESTAMP, numbers TEXT, total INT, result TEXT, total_bets INT)")
+        c.execute("CREATE TABLE IF NOT EXISTS dice_bets (round_id INT, user_id INT, amount REAL, bet_type TEXT, win REAL)")
+        c.execute("CREATE TABLE IF NOT EXISTS dice_state (key TEXT PRIMARY KEY, value TEXT)")
+        c.execute("INSERT OR IGNORE INTO dice_state (key, value) VALUES ('current_round', '0')")
+        c.execute("INSERT OR IGNORE INTO dice_state (key, value) VALUES ('end_time', '')")
+        c.execute("CREATE TABLE IF NOT EXISTS global_limits (item_id INT PRIMARY KEY)")
+        c.execute("PRAGMA table_info(global_limits)")
+        cols = [col[1] for col in c.fetchall()]
+        if "remaining" not in cols:
+            c.execute("ALTER TABLE global_limits ADD COLUMN remaining INT DEFAULT 0")
+        c.execute("INSERT OR IGNORE INTO global_limits (item_id, remaining) VALUES (3, 1)")
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS lotteries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT,
+                prize TEXT,
+                cost REAL,
+                draw_time TIMESTAMP,
+                status INTEGER DEFAULT 0,
+                winner_id INTEGER,
+                created_by INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                channel_id TEXT,
+                need_msgs INTEGER DEFAULT 0,
+                msg_count INTEGER DEFAULT 0,
+                winners TEXT DEFAULT NULL
+            )
+        """)
+        c.execute("PRAGMA table_info(lotteries)")
+        existing_cols = [col[1] for col in c.fetchall()]
+        if "channel_id" not in existing_cols:
+            c.execute("ALTER TABLE lotteries ADD COLUMN channel_id TEXT")
+        if "need_msgs" not in existing_cols:
+            c.execute("ALTER TABLE lotteries ADD COLUMN need_msgs INTEGER DEFAULT 0")
+        if "msg_count" not in existing_cols:
+            c.execute("ALTER TABLE lotteries ADD COLUMN msg_count INTEGER DEFAULT 0")
+        if "winners" not in existing_cols:
+            c.execute("ALTER TABLE lotteries ADD COLUMN winners TEXT DEFAULT NULL")
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS lottery_participants (
+                lottery_id INTEGER,
+                user_id INTEGER,
+                participated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (lottery_id, user_id)
+            )
+        """)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS lottery_fail_notify (
+                lottery_id INTEGER,
+                user_id INTEGER,
+                chat_id INTEGER,
+                PRIMARY KEY (lottery_id, user_id, chat_id)
+            )
+        """)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS daily_welfare (
+                user_id INTEGER,
+                date TEXT,
+                count INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, date)
+            )
+        """)
+        conn.commit()
+
+# ---------- 用户函数 ----------
+def get_user(uid, name):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM users WHERE user_id=?", (uid,))
+        if not c.fetchone():
+            c.execute("INSERT INTO users (user_id, nickname, coins) VALUES (?,?,0)", (uid, name))
+        else:
+            c.execute("UPDATE users SET nickname=? WHERE user_id=?", (name, uid))
+        conn.commit()
+
+def get_today_gain(uid):
+    today = now_cn().strftime('%Y-%m-%d')
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT gain FROM daily WHERE user_id=? AND date=?", (uid, today))
+        row = c.fetchone()
+        return row[0] if row else 0.0
+
+def add_today_gain(uid, amt):
+    today = now_cn().strftime('%Y-%m-%d')
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO daily (user_id, date, gain) VALUES (?,?,?) ON CONFLICT(user_id,date) DO UPDATE SET gain = gain + ?",
+                  (uid, today, amt, amt))
+        conn.commit()
+
+def add_coins(uid, amt, reason):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE users SET coins = coins + ? WHERE user_id=?", (amt, uid))
+        if c.rowcount == 0:
+            c.execute("INSERT INTO users (user_id, nickname, coins) VALUES (?,?,?)", (uid, "未知", amt))
+        c.execute("INSERT INTO tx (user_id, type, amount, desc, ts) VALUES (?,?,?,?,?)",
+                  (uid, "收入" if amt > 0 else "支出", abs(amt), reason, now_cn()))
+        conn.commit()
+
+def sub_coins(uid, amt, reason):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT coins FROM users WHERE user_id=?", (uid,))
+        row = c.fetchone()
+        if not row or row[0] < amt:
+            return False
+        c.execute("UPDATE users SET coins = coins - ? WHERE user_id=?", (amt, uid))
+        c.execute("INSERT INTO tx (user_id, type, amount, desc, ts) VALUES (?,?,?,?,?)",
+                  (uid, "支出", amt, reason, now_cn()))
+        conn.commit()
+        return True
+
+def get_coins(uid):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT coins FROM users WHERE user_id=?", (uid,))
+        row = c.fetchone()
+        return row[0] if row else 0.0
+
+def history(uid, limit=10):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT type, amount, desc, ts FROM tx WHERE user_id=? ORDER BY ts DESC LIMIT ?", (uid, limit))
+        return c.fetchall() or []
+
+def check_and_use_first_bonus(uid):
+    today = now_cn().strftime('%Y-%m-%d')
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT used FROM daily_first_bonus WHERE user_id=? AND date=?", (uid, today))
+        row = c.fetchone()
+        if row and row[0] == 1:
+            return False
+        c.execute("INSERT OR REPLACE INTO daily_first_bonus (user_id, date, used) VALUES (?,?,1)", (uid, today))
+        conn.commit()
+        return True
+
+# ---------- 限量商品通用 ----------
+def get_remaining(item_id):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT remaining FROM global_limits WHERE item_id=?", (item_id,))
+        row = c.fetchone()
+        return row[0] if row else None
+
+def decrease_remaining(item_id):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE global_limits SET remaining = remaining - 1 WHERE item_id=? AND remaining > 0", (item_id,))
+        conn.commit()
+        return c.rowcount > 0
+
+# ---------- 低保函数 ----------
+def get_welfare_today_count(uid):
+    today = now_cn().strftime('%Y-%m-%d')
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT count FROM daily_welfare WHERE user_id=? AND date=?", (uid, today))
+        row = c.fetchone()
+        return row[0] if row else 0
+
+def add_welfare_record(uid):
+    today = now_cn().strftime('%Y-%m-%d')
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO daily_welfare (user_id, date, count) VALUES (?,?,1) ON CONFLICT(user_id,date) DO UPDATE SET count = count + 1",
+                  (uid, today))
+        conn.commit()
+
+# ========== 键盘 ==========
+def wallet_kb():
+    return Markup([
+        [Btn("🛒 兑换商品", callback_data="shop"),
+         Btn("📚 学分记录", callback_data="history")]
+    ])
+
+def shop_kb():
+    keyboard = []
+    for i, n, p in SHOP:
+        rem = get_remaining(i)
+        if rem is None:
+            text = f"{n} - {p}💎"
+        elif rem > 0:
+            text = f"{n} 剩余{rem} - {p}💎"
+        else:
+            text = f"{n} 已售罄 - {p}💎"
+        keyboard.append([Btn(text, callback_data=f"buy_{i}")])
+    return Markup(keyboard)
+
+# ========== 回调处理器 ==========
+async def cb(update, ctx):
+    if update.callback_query.from_user.is_bot:
+        return
+    if update.effective_chat.type in ('group', 'supergroup'):
+        if update.effective_chat.id not in ALLOWED_GROUPS:
+            await update.callback_query.answer("该群组未授权使用本机器人。")
+            return
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
+    uid = query.from_user.id
+    name = query.from_user.first_name
     data = query.data
 
-    if data == "admin_panel":
-        if user_id not in ADMIN_IDS:
-            await query.edit_message_text("无权访问")
-            return
-        keyboard = [
-            [InlineKeyboardButton("📋 查看所有登记老师", callback_data="admin_list_users")],
-            [InlineKeyboardButton("🟢 查看当前开课老师", callback_data="admin_list_active")],
-            [InlineKeyboardButton("❌ 强制清空某个老师开课", callback_data="admin_clear_active")],
-            [InlineKeyboardButton("🗑 删除登记老师", callback_data="admin_delete_user")],
-            [InlineKeyboardButton("➕ 手动添加登记老师", callback_data="admin_add_user")],
-            [InlineKeyboardButton("📡 设置湖州频道", callback_data="admin_set_channel_b")],
-            [InlineKeyboardButton("📡 设置嘉兴频道", callback_data="admin_set_channel_c")],
-            [InlineKeyboardButton("⏰ 设置个人有效期", callback_data="admin_set_expire")],
-            [InlineKeyboardButton("🔙 返回", callback_data="back_to_menu")],
-        ]
-        await query.edit_message_text("管理员面板：", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    # 设置频道
-    if data in ["admin_set_channel_b", "admin_set_channel_c"]:
-        if user_id not in ADMIN_IDS:
-            return
-        channel = "b" if data == "admin_set_channel_b" else "c"
-        context.user_data["set_channel"] = channel
-        await query.edit_message_text(f"请输入 {channel.upper()} 频道的 Chat ID（负数，例如 -1001234567890）：")
-        context.user_data["admin_set_step"] = ADMIN_SET_CHANNEL
-        return
-
-    # 设置个人有效期
-    if data == "admin_set_expire":
-        if user_id not in ADMIN_IDS:
-            return
-        await query.edit_message_text("请输入要设置有效期的老师ID（数字）：")
-        context.user_data["admin_set_step"] = ADMIN_SET_EXPIRE
-        return
-
-    # 原有回调
-    if data == "admin_add_user":
-        if user_id not in ADMIN_IDS:
-            return
-        await query.edit_message_text("请输入要添加的老师数字ID（例如 123456789）：")
-        context.user_data["admin_add_step"] = ADMIN_ADD_ID
-        return
-
-    if data == "admin_list_users":
-        if user_id not in ADMIN_IDS:
-            return
-        users = load_users()
-        if not users:
-            await query.edit_message_text("暂无登记老师")
-            return
-        lines = ["已登记老师列表："]
-        for uid, info in users.items():
-            last_active = info.get("last_active", "从未开课")
-            lines.append(f"{uid} | {info['name']} | {info['region']} | 最后活跃: {last_active}")
-        text = "\n".join(lines)
-        if len(text) > 4000:
-            await query.edit_message_text("列表过长，请查看日志")
-            logger.info(text)
+    if data == "shop":
+        bal = get_coins(uid)
+        await query.edit_message_text(
+            f"🛒 学分商城\n💎 当前余额：{bal:.2f} 学分\n点击下方按钮兑换商品：",
+            reply_markup=shop_kb()
+        )
+    elif data == "history":
+        rows = history(uid)
+        if not rows:
+            txt = "📭 暂无学分记录"
         else:
-            await query.edit_message_text(text)
-        return
-
-    if data == "admin_list_active":
-        if user_id not in ADMIN_IDS:
+            lines = []
+            for typ, amt, desc, ts in rows:
+                sign = "✅ +" if typ == "收入" else "❌ -"
+                lines.append(f"{sign}{amt:.2f}  {desc}  {ts[:16]}")
+            txt = "📋 最近学分记录：\n\n" + "\n".join(lines)
+        await query.edit_message_text(txt, reply_markup=Markup([[Btn("🔙 返回钱包", callback_data="back")]]))
+    elif data == "back":
+        bal = get_coins(uid)
+        link = f'<a href="tg://user?id={uid}">{name}</a>'
+        await query.edit_message_text(
+            f"👛 我的钱包\n\n用户：{link}\n余额：{bal:.2f} 学分",
+            reply_markup=wallet_kb(),
+            parse_mode=ParseMode.HTML
+        )
+    elif data.startswith("buy_"):
+        iid = int(data.split("_")[1])
+        item = next((i for i in SHOP if i[0] == iid), None)
+        if not item:
+            await query.edit_message_text("❌ 商品不存在")
             return
-        active = load_active()
-        if not active:
-            await query.edit_message_text("当前无开课老师")
+        _, n, p = item
+        current = get_coins(uid)
+        remaining = get_remaining(iid)
+        if remaining is not None and remaining <= 0:
+            await query.edit_message_text(
+                "❌ 商品已换完，下次早点来哦！",
+                reply_markup=Markup([[Btn("🔙 返回钱包", callback_data="back")]])
+            )
             return
-        lines = ["开课老师列表："]
-        for uid, info in active.items():
-            lines.append(f"{uid} | {info['name']} | {info['region']} | 开始时间 {info['start_time']}")
-        text = "\n".join(lines)
-        await query.edit_message_text(text)
-        return
-
-    if data == "admin_clear_active":
-        if user_id not in ADMIN_IDS:
+        if current < p:
+            await query.edit_message_text(
+                f"❌ 学分不足！需要 {p} 学分，你只有 {current:.2f} 学分",
+                reply_markup=Markup([[Btn("🔙 返回钱包", callback_data="back")]])
+            )
             return
-        await query.edit_message_text("请输入要强制下课的老师的数字ID（仅数字）：")
-        context.user_data["admin_clear_target"] = True
-        return
-
-    if data == "admin_delete_user":
-        if user_id not in ADMIN_IDS:
+        confirm_kb = Markup([
+            [Btn("✅ 确认兑换", callback_data=f"confirm_buy_{iid}")],
+            [Btn("🔙 取消", callback_data="back_to_shop")]
+        ])
+        await query.edit_message_text(
+            f"❓ 确认兑换 {n}？\n消耗：{p} 学分\n当前余额：{current:.2f} 学分\n\n请确认是否兑换。",
+            reply_markup=confirm_kb
+        )
+    elif data.startswith("confirm_buy_"):
+        iid = int(data.split("_")[2])
+        item = next((i for i in SHOP if i[0] == iid), None)
+        if not item:
+            await query.edit_message_text("❌ 商品不存在")
             return
-        await query.edit_message_text("请输入要删除的老师数字ID：")
-        context.user_data["admin_delete_target"] = True
-        return
-
-    if data == "set_name":
-        if not await is_member_of_group_a(user_id, context):
-            await query.edit_message_text("❌ 您未加入开课群，无法设置昵称。")
+        _, n, p = item
+        current = get_coins(uid)
+        remaining = get_remaining(iid)
+        if remaining is not None and remaining <= 0:
+            await query.edit_message_text(
+                "❌ 商品已换完，下次早点来哦！",
+                reply_markup=Markup([[Btn("🔙 返回钱包", callback_data="back")]])
+            )
             return
-        await query.edit_message_text("请输入您的昵称：")
-        context.user_data["awaiting_name"] = True
-        return
-
-    if data == "set_region":
-        if not await is_member_of_group_a(user_id, context):
-            await query.edit_message_text("❌ 您未加入开课群，无法设置地区。")
+        if current < p:
+            await query.edit_message_text(
+                f"❌ 学分不足！需要 {p} 学分，你只有 {current:.2f} 学分",
+                reply_markup=Markup([[Btn("🔙 返回钱包", callback_data="back")]])
+            )
             return
-        keyboard = [
-            [InlineKeyboardButton("湖州同学会", callback_data="region_湖州")],
-            [InlineKeyboardButton("嘉兴同学会", callback_data="region_嘉兴")],
-            [InlineKeyboardButton("返回", callback_data="back_to_menu")],
-        ]
-        await query.edit_message_text("选择地区：", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    if data.startswith("region_"):
-        region = data.split("_")[1]
-        user_info = get_user_info(user_id)
-        if not user_info or "name" not in user_info:
-            await query.edit_message_text("请先设置昵称")
-            return
-        set_user_info(user_id, user_info["name"], region)
-        await query.edit_message_text(f"✅ 地区已设置为 {region}同学会")
-        return
-
-    if data == "my_info":
-        user_info = get_user_info(user_id)
-        if not user_info:
-            await query.edit_message_text("未登记")
-            return
-        active = load_active()
-        status = "🟢 开课中" if user_id in active else "🔴 未开课"
-        # 显示有效期（如果有）
-        config = load_config()
-        expire_str = config.get("user_expires", {}).get(str(user_id))
-        if expire_str:
+        if sub_coins(uid, p, f"购买 {n}"):
+            if remaining is not None:
+                decrease_remaining(iid)
+            new_balance = get_coins(uid)
+            success_kb = Markup([[Btn("🔙 返回钱包", callback_data="back")]])
+            await query.edit_message_text(
+                f"✅ {n} 兑换成功！消耗 {p} 学分，当前余额 {new_balance:.2f} 学分。",
+                reply_markup=success_kb
+            )
+            if update.effective_chat.type in ('group', 'supergroup'):
+                try:
+                    msg = f"🎉 {name} 成功兑换了 {n}！消耗 {p} 学分。"
+                    await ctx.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=msg,
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception as e:
+                    print(f"群组通知发送失败: {e}")
+            for aid in ADMIN_IDS:
+                try:
+                    admin_msg = f"用户 {name}（ID: {uid}）兑换了 {n}，消耗 {p} 学分。"
+                    await ctx.bot.send_message(
+                        chat_id=aid,
+                        text=admin_msg
+                    )
+                except Exception as e:
+                    print(f"私聊管理员 {aid} 失败: {e}")
             try:
-                expire_dt = datetime.fromisoformat(expire_str)
-                if expire_dt > datetime.now(timezone.utc):
-                    status += f"\n⏰ 有效期至: {expire_dt.strftime('%Y-%m-%d %H:%M')}"
-                else:
-                    status += "\n⛔ 已过期（请联系管理员续期）"
-            except:
+                await ctx.bot.send_message(
+                    chat_id=uid,
+                    text=f"📝 购买记录\n商品：{n}\n消耗：{p} 学分\n余额：{new_balance:.2f} 学分"
+                )
+            except Exception:
                 pass
-        text = f"昵称：{user_info['name']}\n地区：{user_info['region']}同学会\n状态：{status}"
-        await query.edit_message_text(text)
-        return
-
-    if data == "back_to_menu":
-        user_info = get_user_info(user_id)
-        if user_info:
-            text = f"✅ 已登记：{user_info['name']}（{user_info['region']}同学会）"
         else:
-            text = "🤖 请完成登记"
-        keyboard = [
-            [InlineKeyboardButton("📝 登记/修改昵称", callback_data="set_name")],
-            [InlineKeyboardButton("🌍 设置地区（湖州/嘉兴）", callback_data="set_region")],
-            [InlineKeyboardButton("👤 查看我的信息", callback_data="my_info")],
-        ]
-        if user_id in ADMIN_IDS:
-            keyboard.append([InlineKeyboardButton("🔧 管理员面板", callback_data="admin_panel")])
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-        return
+            await query.edit_message_text(
+                "❌ 兑换失败，请稍后再试",
+                reply_markup=Markup([[Btn("🔙 返回钱包", callback_data="back")]])
+            )
+    elif data == "back_to_shop":
+        bal = get_coins(uid)
+        await query.edit_message_text(
+            f"🛒 学分商城\n💎 当前余额：{bal:.2f} 学分\n点击下方按钮兑换商品：",
+            reply_markup=shop_kb()
+        )
 
-# ---------- 私聊文本处理 ----------
-async def private_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        return
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
+    # ---------- 抽奖参与回调 ----------
+    elif data.startswith("lottery_join_"):
+        lottery_id = int(data.split("_")[2])
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT title, prize, cost, status, draw_time, channel_id, need_msgs, msg_count FROM lotteries WHERE id=?", (lottery_id,))
+            row = c.fetchone()
+            if not row:
+                await query.answer("❌ 抽奖不存在", show_alert=True)
+                return
+            title, prize, cost, status, draw_time, channel_id, need_msgs, msg_count = row
+            if isinstance(draw_time, str):
+                draw_time = datetime.fromisoformat(draw_time)
+            if status != 0:
+                await query.answer("❌ 该抽奖已结束或已开奖", show_alert=True)
+                return
+            if now_cn() > draw_time:
+                await query.answer("❌ 该抽奖已过开奖时间", show_alert=True)
+                return
 
-    # ----- 设置频道 Chat ID -----
-    if context.user_data.get("admin_set_step") == ADMIN_SET_CHANNEL:
-        channel = context.user_data.get("set_channel")
-        if not channel:
-            await update.message.reply_text("会话已过期，请重新开始")
-            return
+            if need_msgs > 0 and msg_count < need_msgs:
+                await query.answer(f"❌ 群内发言数未达标（{msg_count}/{need_msgs}），暂无法参与", show_alert=True)
+                return
+
+            c.execute("SELECT 1 FROM lottery_participants WHERE lottery_id=? AND user_id=?", (lottery_id, uid))
+            if c.fetchone():
+                await query.answer("您已参与过本次抽奖", show_alert=True)
+                return
+
+            if channel_id:
+                try:
+                    member = await ctx.bot.get_chat_member(chat_id=channel_id, user_id=uid)
+                    if member.status not in ['member', 'administrator', 'creator']:
+                        if query.message.chat.type in ('group', 'supergroup'):
+                            chat_id = query.message.chat.id
+                            with db_connect() as conn2:
+                                c2 = conn2.cursor()
+                                c2.execute("SELECT 1 FROM lottery_fail_notify WHERE lottery_id=? AND user_id=? AND chat_id=?",
+                                           (lottery_id, uid, chat_id))
+                                if not c2.fetchone():
+                                    try:
+                                        mention = f'<a href="tg://user?id={uid}">{name}</a>'
+                                        await ctx.bot.send_message(
+                                            chat_id=chat_id,
+                                            text=f"⚠️ {mention} 参与抽奖「{title}」需要先关注频道 {channel_id}，请关注后再次尝试。",
+                                            parse_mode=ParseMode.HTML
+                                        )
+                                        c2.execute("INSERT INTO lottery_fail_notify (lottery_id, user_id, chat_id) VALUES (?,?,?)",
+                                                   (lottery_id, uid, chat_id))
+                                        conn2.commit()
+                                    except Exception as e:
+                                        print(f"发送群聊提示失败: {e}")
+                        await query.answer(f"❌ 请先关注频道 {channel_id} 再来参与", show_alert=True)
+                        return
+                except Exception as e:
+                    await query.answer(f"❌ 频道校验失败，请稍后重试", show_alert=True)
+                    print(f"频道校验异常: {e}")
+                    return
+
+            bal = get_coins(uid)
+            if bal < cost:
+                await query.answer(f"❌ 学分不足，需要 {cost} 学分", show_alert=True)
+                return
+            if not sub_coins(uid, cost, f"参与抽奖 {title} - {prize}"):
+                await query.answer("❌ 扣学分失败", show_alert=True)
+                return
+
+            c.execute("INSERT INTO lottery_participants (lottery_id, user_id) VALUES (?, ?)", (lottery_id, uid))
+            conn.commit()
+
         try:
-            chat_id = int(text)
-        except ValueError:
-            await update.message.reply_text("❌ 请输入有效的数字 Chat ID：")
-            return
-        # 保存 Chat ID
-        config = load_config()
-        if channel == "b":
-            config["channel_b"]["chat_id"] = chat_id
-            config["channel_b"]["enabled"] = True
+            await ctx.bot.send_message(
+                chat_id=uid,
+                text=f"✅ 你已成功参与抽奖「{title}」！\n奖品：{prize}\n消耗：{cost} 学分\n开奖时间：{draw_time}\n请等待开奖结果。"
+            )
+        except Exception:
+            pass
+
+        with db_connect() as conn2:
+            c2 = conn2.cursor()
+            c2.execute("SELECT user_id FROM lottery_participants WHERE lottery_id=?", (lottery_id,))
+            participants = [p[0] for p in c2.fetchall()]
+            names = []
+            for pid in participants:
+                c3 = conn2.cursor()
+                c3.execute("SELECT nickname FROM users WHERE user_id=?", (pid,))
+                nick = c3.fetchone()
+                names.append(nick[0] if nick else str(pid))
+
+        expired = now_cn() > draw_time
+        already = True
+        display_prize = prize.replace(',', '、').replace('，', '、')
+        msg_text = f"🎰 当前抽奖活动\n标题：{title}\n奖品：{display_prize}\n消耗：{cost} 学分\n开奖时间：{draw_time}\n"
+        if channel_id:
+            msg_text += f"📢 参与条件：需关注频道 {channel_id}\n"
+        if need_msgs > 0:
+            msg_text += f"💬 需群内发言数 ≥ {need_msgs} 条（当前 {msg_count} 条）\n"
+        if names:
+            msg_text += f"👥 已参与（{len(names)}人）：{', '.join(names)}\n"
         else:
-            config["channel_c"]["chat_id"] = chat_id
-            config["channel_c"]["enabled"] = True
-        save_config(config)
-        await update.message.reply_text(f"✅ 已设置 {channel.upper()} 频道 Chat ID: {chat_id}\n接下来请设置发送间隔（小时数）：")
-        # 切换到间隔设置状态
-        context.user_data["admin_set_step"] = ADMIN_SET_INTERVAL
-        return
-
-    # ----- 设置发送间隔 -----
-    if context.user_data.get("admin_set_step") == ADMIN_SET_INTERVAL:
-        channel = context.user_data.get("set_channel")
-        if not channel:
-            await update.message.reply_text("会话已过期，请重新开始")
-            return
-        try:
-            interval = float(text)
-            if interval <= 0:
-                raise ValueError
-        except:
-            await update.message.reply_text("❌ 请输入正数（小时），例如 24")
-            return
-        config = load_config()
-        if channel == "b":
-            config["channel_b"]["interval_hours"] = interval
-            config["last_sent_b"] = None
+            msg_text += "👥 暂无人参与\n"
+        if expired:
+            msg_text += "⏰ 该抽奖已过开奖时间，无法参与。"
+        elif already:
+            msg_text += "你已参与，请等待开奖。"
         else:
-            config["channel_c"]["interval_hours"] = interval
-            config["last_sent_c"] = None
-        save_config(config)
-        await update.message.reply_text(f"✅ 设置完成！每隔 {interval} 小时自动发送出勤到 {channel.upper()} 频道。")
-        context.user_data.pop("admin_set_step", None)
-        context.user_data.pop("set_channel", None)
-        return
+            msg_text += "点击下方按钮参与！"
 
-    # ----- 设置个人有效期（输入用户ID）-----
-    if context.user_data.get("admin_set_step") == ADMIN_SET_EXPIRE:
+        original_markup = query.message.reply_markup
         try:
-            target_id = int(text)
-        except ValueError:
-            await update.message.reply_text("❌ 请输入有效的数字ID：")
-            return
-        if not get_user_info(target_id):
-            await update.message.reply_text(f"⚠️ 老师 ID {target_id} 未登记，请先添加老师。")
-            context.user_data.pop("admin_set_step", None)
-            return
-        context.user_data["expire_target"] = target_id
-        await update.message.reply_text("请输入有效期天数（例如 30，输入 0 表示无限期）：")
-        context.user_data["admin_set_step"] = ADMIN_SET_INTERVAL  # 重用间隔状态，但含义不同，实际为有效期天数
-        # 改变标志以免混淆
-        context.user_data["expire_days_mode"] = True
-        return
+            await query.edit_message_text(msg_text, reply_markup=original_markup, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            print(f"编辑抽奖消息失败: {e}")
 
-    # ----- 接收有效期天数 -----
-    if context.user_data.get("admin_set_step") == ADMIN_SET_INTERVAL and context.user_data.get("expire_days_mode"):
-        target_id = context.user_data.get("expire_target")
-        if not target_id:
-            await update.message.reply_text("会话已过期，请重新开始")
-            return
-        try:
-            days = int(text)
-            if days < 0:
-                raise ValueError
-        except:
-            await update.message.reply_text("❌ 请输入非负整数（0 表示无限期）：")
-            return
-        config = load_config()
-        if days == 0:
-            # 清除有效期
-            if str(target_id) in config.get("user_expires", {}):
-                del config["user_expires"][str(target_id)]
-                save_config(config)
-            await update.message.reply_text(f"✅ 已取消老师 {target_id} 的有效期限制（无限期）。")
-        else:
-            expire_time = datetime.now(timezone.utc) + timedelta(days=days)
-            expire_str = expire_time.isoformat()
-            if "user_expires" not in config:
-                config["user_expires"] = {}
-            config["user_expires"][str(target_id)] = expire_str
-            save_config(config)
-            await update.message.reply_text(f"✅ 老师 {target_id} 的有效期已设置为 {days} 天，到期时间为 {expire_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-        context.user_data.pop("admin_set_step", None)
-        context.user_data.pop("expire_target", None)
-        context.user_data.pop("expire_days_mode", None)
-        return
+        await query.answer("✅ 参与成功！", show_alert=False)
 
-    # ----- 原有管理员添加老师 ----------
-    step = context.user_data.get("admin_add_step")
-    if step == ADMIN_ADD_ID:
-        try:
-            target_id = int(text)
-        except ValueError:
-            await update.message.reply_text("❌ 请输入有效的数字ID：")
-            return
-        if get_user_info(target_id):
-            await update.message.reply_text(f"⚠️ 老师 ID {target_id} 已登记，请勿重复添加。")
-            context.user_data.pop("admin_add_step", None)
-            return
-        context.user_data["admin_add_target_id"] = target_id
-        context.user_data["admin_add_step"] = ADMIN_ADD_NAME
-        await update.message.reply_text("请输入老师的昵称（例如：王老师）：")
-        return
+# ========== 测试回调 ==========
+async def test_callback(update, ctx):
+    await update.message.reply_text(
+        "测试按钮：",
+        reply_markup=Markup([[Btn("点击测试", callback_data="test")]])
+    )
 
-    if step == ADMIN_ADD_NAME:
-        name = text.strip()
-        if not name:
-            await update.message.reply_text("昵称不能为空，请重新输入：")
-            return
-        context.user_data["admin_add_name"] = name
-        context.user_data["admin_add_step"] = ADMIN_ADD_REGION
-        keyboard = [
-            [InlineKeyboardButton("湖州同学会", callback_data="admin_add_region_湖州")],
-            [InlineKeyboardButton("嘉兴同学会", callback_data="admin_add_region_嘉兴")],
-        ]
-        await update.message.reply_text("请选择该老师的地区：", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    # ----- 原有管理员强制下课 ----------
-    if context.user_data.get("admin_clear_target"):
-        try:
-            target_id = int(text)
-        except ValueError:
-            await update.message.reply_text("请输入数字ID")
-            context.user_data.pop("admin_clear_target", None)
-            return
-        active = load_active()
-        if target_id in active:
-            info = active.pop(target_id)
-            save_active(active)
-            await update.message.reply_text(f"✅ 已强制下课 {info['name']} (ID:{target_id})")
-        else:
-            await update.message.reply_text(f"ID {target_id} 当前未开课")
-        context.user_data.pop("admin_clear_target", None)
-        return
-
-    # ----- 原有管理员删除老师 ----------
-    if context.user_data.get("admin_delete_target"):
-        try:
-            target_id = int(text)
-        except ValueError:
-            await update.message.reply_text("请输入数字ID")
-            context.user_data.pop("admin_delete_target", None)
-            return
-        user_info = get_user_info(target_id)
-        if user_info:
-            delete_user_info(target_id)
-            await update.message.reply_text(f"✅ 已删除老师 {user_info['name']} (ID:{target_id})")
-        else:
-            await update.message.reply_text(f"ID {target_id} 未登记")
-        context.user_data.pop("admin_delete_target", None)
-        return
-
-    # ----- 原有普通用户设置昵称 ----------
-    if context.user_data.get("awaiting_name"):
-        if not await is_member_of_group_a(user_id, context):
-            await update.message.reply_text("❌ 您未加入开课群，无法设置昵称。")
-            context.user_data.pop("awaiting_name", None)
-            return
-        new_name = text
-        if not new_name:
-            await update.message.reply_text("昵称不能为空")
-            return
-        user_info = get_user_info(user_id)
-        region = user_info.get("region") if user_info else ""
-        set_user_info(user_id, new_name, region)
-        await update.message.reply_text(f"✅ 昵称已设置为 {new_name}\n请继续设置地区（/start）")
-        context.user_data.pop("awaiting_name", None)
-
-# ---------- 管理员添加老师地区选择回调 ----------
-async def admin_add_region_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def test_cb(update, ctx):
+    print(">>> 测试回调被触发！")
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
+    await query.edit_message_text("✅ 回调测试成功！")
+
+# ========== 管理员命令 ==========
+async def admin_credit_handler(update, ctx):
+    # 仅限群聊，回复消息
+    if update.effective_chat.type not in ('group', 'supergroup'):
+        return
+    if update.effective_chat.id not in ALLOWED_GROUPS:
+        return
+    user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        await query.edit_message_text("无权操作")
         return
-    if context.user_data.get("admin_add_step") != ADMIN_ADD_REGION:
-        await query.edit_message_text("流程已过期，请重新开始")
+    if not update.message.reply_to_message:
+        await update.message.reply_text("请回复你要操作的用户的消息，然后发送 /学分 +数字 或 /学分 -数字")
         return
-    region = query.data.split("_")[-1]
-    target_id = context.user_data.get("admin_add_target_id")
-    name = context.user_data.get("admin_add_name")
-    if not target_id or not name:
-        await query.edit_message_text("数据丢失，请重新添加")
-        context.user_data.pop("admin_add_step", None)
+    target = update.message.reply_to_message.from_user
+    target_id = target.id
+    target_name = target.first_name
+    text = update.message.text.strip()
+    match = re.match(r'^/学分\s+([+-]?\d+(?:\.\d+)?)', text)
+    if not match:
+        await update.message.reply_text("格式错误，请使用：/学分 +数字 或 /学分 -数字 (数字可为小数)")
         return
-    users = load_users()
-    users[target_id] = {"name": name, "region": region}
-    save_users(users)
-    await query.edit_message_text(f"✅ 已成功添加老师：{name}（{region}同学会）ID: {target_id}")
-    context.user_data.pop("admin_add_step", None)
-    context.user_data.pop("admin_add_target_id", None)
-    context.user_data.pop("admin_add_name", None)
+    delta_str = match.group(1)
+    try:
+        delta = float(delta_str)
+    except ValueError:
+        await update.message.reply_text("数字格式无效")
+        return
+    get_user(target_id, target_name)
+    add_coins(target_id, delta, reason=f"管理员 {user_id} 操作")
+    new_balance = get_coins(target_id)
+    await update.message.reply_text(
+        f"✅ 已为 {target_name}  {'增加' if delta > 0 else '扣除'} {abs(delta):.2f} 学分\n"
+        f"📚 当前余额：{new_balance:.2f} 学分"
+    )
 
-# ---------- 群组消息处理 ----------
-async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+# ========== 私聊管理员加学分（命令 /xf） ==========
+async def admin_credit_private(update, ctx):
+    """私聊处理 /xf @用户名 金额 或 /xf 用户ID 金额 或 /xf 金额（给自己加）"""
+    if update.effective_chat.type != 'private':
         return
-    chat_id = update.effective_chat.id
-    raw_text = update.message.text.strip()
-    user = update.effective_user
-    if not user:
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    args = ctx.args
+    if len(args) == 0:
+        await update.message.reply_text(
+            "格式错误，请使用：\n"
+            "/xf 金额（给自己加）\n"
+            "/xf @用户名 金额\n"
+            "/xf 用户ID 金额\n"
+            "金额可带正负号，如 +100 或 -50"
+        )
         return
 
-    text = raw_text.split('@')[0].strip()
+    # ---------- 情况1：只有一个参数，给自己加 ----------
+    if len(args) == 1:
+        delta_str = args[0]
+        try:
+            delta = float(delta_str)
+        except ValueError:
+            await update.message.reply_text("金额格式无效，请输入数字。")
+            return
+        target_uid = user_id
+        target_name = update.effective_user.first_name or str(target_uid)
+        get_user(target_uid, target_name)
+        add_coins(target_uid, delta, reason=f"管理员 {user_id} 给自己加学分")
+        new_balance = get_coins(target_uid)
+        action = "增加" if delta > 0 else "扣除"
+        await update.message.reply_text(
+            f"✅ 已为自己 {action} {abs(delta):.2f} 学分\n"
+            f"📚 当前余额：{new_balance:.2f} 学分"
+        )
+        return
 
-    if chat_id == GROUP_A_CHAT_ID:
-        user_id = user.id
+    # ---------- 情况2：两个参数，给他人加/扣 ----------
+    if len(args) != 2:
+        await update.message.reply_text(
+            "格式错误，请使用：\n"
+            "/xf 金额（给自己加）\n"
+            "/xf @用户名 金额\n"
+            "/xf 用户ID 金额\n"
+            "金额可带正负号，如 +100 或 -50"
+        )
+        return
 
-        # 获取用户登记信息
-        user_info = get_user_info(user_id)
-        if not user_info or not user_info.get("name") or not user_info.get("region"):
-            if user_id in ADMIN_IDS:
+    target_identifier = args[0]
+    delta_str = args[1]
+    try:
+        delta = float(delta_str)
+    except ValueError:
+        await update.message.reply_text("金额格式无效，请输入数字。")
+        return
+
+    # 解析目标用户ID
+    target_uid = None
+    target_name = None
+    if target_identifier.startswith('@'):
+        try:
+            chat = await ctx.bot.get_chat(target_identifier)
+            target_uid = chat.id
+            target_name = chat.first_name or str(target_uid)
+        except Exception:
+            await update.message.reply_text(f"❌ 无法找到用户 {target_identifier}，请确认用户名正确或使用数字ID。")
+            return
+    else:
+        try:
+            target_uid = int(target_identifier)
+            try:
+                chat = await ctx.bot.get_chat(target_uid)
+                target_name = chat.first_name or str(target_uid)
+            except:
+                target_name = str(target_uid)
+        except ValueError:
+            await update.message.reply_text("❌ 用户ID必须是数字。")
+            return
+
+    # 执行加/扣学分
+    get_user(target_uid, target_name)
+    add_coins(target_uid, delta, reason=f"管理员 {user_id} 私聊操作")
+    new_balance = get_coins(target_uid)
+    action = "增加" if delta > 0 else "扣除"
+
+    # 回复管理员
+    await update.message.reply_text(
+        f"✅ 已为 {target_name} (ID: {target_uid}) {action} {abs(delta):.2f} 学分\n"
+        f"📚 当前余额：{new_balance:.2f} 学分"
+    )
+
+    # ========== 私聊通知被操作的用户 ==========
+    try:
+        admin_name = update.effective_user.first_name or str(user_id)
+        admin_link = f'<a href="tg://user?id={user_id}">{admin_name}</a>'
+        await ctx.bot.send_message(
+            chat_id=target_uid,
+            text=(
+                f"📢 学分变动通知\n"
+                f"👮 操作人：{admin_link}\n"
+                f"{'➕ 增加' if delta > 0 else '➖ 扣除'}：{abs(delta):.2f} 学分\n"
+                f"📚 当前余额：{new_balance:.2f} 学分"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        print(f"通知用户 {target_uid} 失败: {e}")
+
+# ========== 管理员商品管理 ==========
+async def admin_add_item(update, ctx):
+    if update.effective_chat.type != 'private':
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    args = ctx.args
+    if len(args) != 3:
+        await update.message.reply_text("用法：/additem <商品名称> <价格> <限量（0为无限）>\n例如：/additem 测试商品 100 5")
+        return
+    name = args[0]
+    try:
+        price = float(args[1])
+        if price <= 0:
+            raise ValueError
+        limit_total = int(args[2])
+        if limit_total < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("价格必须是正数，限量必须是非负整数。")
+        return
+    new_id = len(SHOP) + 1
+    SHOP.append((new_id, name, price))
+    if limit_total > 0:
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("INSERT OR IGNORE INTO global_limits (item_id, remaining) VALUES (?, ?)", (new_id, limit_total))
+            conn.commit()
+    await update.message.reply_text(f"✅ 商品「{name}」已上架，ID={new_id}，价格={price}，限量={limit_total if limit_total>0 else '无限'}")
+
+async def admin_list_items(update, ctx):
+    if update.effective_chat.type != 'private':
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    if not SHOP:
+        await update.message.reply_text("暂无商品。")
+        return
+    text = "📦 商品列表：\n"
+    for gid, name, price in SHOP:
+        rem = get_remaining(gid)
+        if rem is None:
+            text += f"ID:{gid} {name} - {price}💎 (无限量)\n"
+        else:
+            text += f"ID:{gid} {name} - {price}💎 (剩余{rem})\n"
+    await update.message.reply_text(text)
+
+async def admin_del_item(update, ctx):
+    if update.effective_chat.type != 'private':
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    args = ctx.args
+    if len(args) != 1:
+        await update.message.reply_text("用法：/delitem <商品ID>")
+        return
+    try:
+        gid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("商品ID必须是数字。")
+        return
+    global SHOP
+    new_shop = [item for item in SHOP if item[0] != gid]
+    if len(new_shop) == len(SHOP):
+        await update.message.reply_text(f"❌ 商品ID {gid} 不存在。")
+    else:
+        SHOP = new_shop
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM global_limits WHERE item_id = ?", (gid,))
+            conn.commit()
+        await update.message.reply_text(f"✅ 商品ID {gid} 已删除。")
+
+# ========== 抽奖管理员命令 ==========
+async def cmd_create_lottery(update, ctx):
+    if update.effective_chat.type != 'private':
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    text = update.message.text.strip()
+    if text.startswith('/cj'):
+        content = text[3:].strip()
+    else:
+        content = text
+
+    channel_id = None
+    need_msgs = 0
+    parts = content.split()
+    if '-c' in parts:
+        idx = parts.index('-c')
+        if idx + 1 < len(parts):
+            channel_id = parts[idx + 1]
+            parts.pop(idx)
+            parts.pop(idx)
+    if '-f' in parts:
+        idx = parts.index('-f')
+        if idx + 1 < len(parts):
+            try:
+                need_msgs = int(parts[idx + 1])
+                if need_msgs < 0:
+                    need_msgs = 0
+            except ValueError:
+                need_msgs = 0
+            parts.pop(idx)
+            parts.pop(idx)
+    content = ' '.join(parts)
+
+    time_pattern = r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})'
+    match = re.search(time_pattern, content)
+    if not match:
+        await update.message.reply_text(
+            "未找到有效时间，请使用格式：YYYY-MM-DD HH:MM\n"
+            "示例：/cj 8月活动 商品1,商品2 10 2026-08-01 20:00 -c @channel -f 80"
+        )
+        return
+    draw_time_str = match.group(1)
+    try:
+        dt = datetime.strptime(draw_time_str, "%Y-%m-%d %H:%M")
+        now = now_cn()
+        if dt <= now:
+            await update.message.reply_text(f"开奖时间必须在未来。当前时间：{now.strftime('%Y-%m-%d %H:%M')}")
+            return
+        if (dt - now).total_seconds() < 60:
+            await update.message.reply_text(f"⚠️ 开奖时间与当前时间相差小于1分钟，建议设置至少1分钟后的时间。")
+        draw_time = dt
+    except ValueError:
+        await update.message.reply_text("时间格式无效，请使用 YYYY-MM-DD HH:MM")
+        return
+
+    rest = content.replace(draw_time_str, '').strip()
+    parts = rest.split()
+    if len(parts) < 2:
+        await update.message.reply_text("格式错误，请提供：标题、奖品、消耗学分")
+        return
+    try:
+        cost = float(parts[-1])
+        if cost <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("消耗学分必须是正数。")
+        return
+    title = parts[0]
+    if len(parts) > 2:
+        prize_raw = ' '.join(parts[1:-1])
+    else:
+        prize_raw = "未命名奖品"
+    prize = prize_raw
+
+    if channel_id:
+        try:
+            chat = await ctx.bot.get_chat(channel_id)
+            try:
+                me = await ctx.bot.get_me()
+                member = await ctx.bot.get_chat_member(chat_id=channel_id, user_id=me.id)
+                if member.status not in ['administrator', 'creator']:
+                    await update.message.reply_text(
+                        f"⚠️ 机器人在频道 {channel_id} 中，但不是管理员，无法校验成员关注状态。\n"
+                        f"请将机器人设为管理员后再试。"
+                    )
+                    return
+            except Exception as e:
+                await update.message.reply_text(
+                    f"❌ 机器人不在频道 {channel_id} 中，或无法获取频道信息。\n"
+                    f"请先将机器人加入该频道并设为管理员，然后重新创建抽奖。\n"
+                    f"错误详情: {e}"
+                )
                 return
-            bot_username = context.bot.username
-            url = f"https://t.me/{bot_username}" if bot_username else "https://t.me/"
-            keyboard = [[InlineKeyboardButton("📩 点击这里与机器人私聊进行登记", url=url)]]
+        except Exception as e:
             await update.message.reply_text(
-                "❌ 您尚未登记，请先私聊机器人完成登记。",
-                reply_markup=InlineKeyboardMarkup(keyboard)
+                f"❌ 无法访问频道 {channel_id}，请确认频道存在且机器人已加入。\n"
+                f"错误详情: {e}"
             )
             return
 
-        # 检查个人有效期（仅针对开课命令）
-        if text == "开课":
-            config = load_config()
-            expire_str = config.get("user_expires", {}).get(str(user_id))
-            if expire_str:
-                try:
-                    expire_dt = datetime.fromisoformat(expire_str)
-                    if datetime.now(timezone.utc) >= expire_dt:
-                        # 已过期，私聊通知，群内无任何提示
-                        await update.message.reply_text("⛔ 您的登记已过期，请联系管理员续期。")
-                        logger.info(f"用户 {user_info['name']} (ID:{user_id}) 尝试开课但已过期，已私聊通知")
-                        return
-                except:
-                    pass
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO lotteries (title, prize, cost, draw_time, status, created_by, channel_id, need_msgs, msg_count) VALUES (?, ?, ?, ?, 0, ?, ?, ?, 0)",
+            (title, prize, cost, draw_time, update.effective_user.id, channel_id, need_msgs)
+        )
+        lid = c.lastrowid
+        conn.commit()
 
-        # 已登记，处理开课/下课
-        active = load_active()
-        if text == "开课":
-            if user_id in active:
-                await update.message.reply_text("已在开课中")
-                return
-            user_info["last_active"] = datetime.now(timezone.utc).isoformat()
-            users = load_users()
-            users[user_id] = user_info
-            save_users(users)
-            active[user_id] = {
-                "name": user_info["name"],
-                "region": user_info["region"],
-                "start_time": datetime.now().isoformat()
-            }
-            save_active(active)
-            await update.message.reply_text(f"✅ {user_info['name']} 开课成功 🟢")
-            return
-        elif text == "下课":
-            if user_id not in active:
-                await update.message.reply_text("未开课")
-                return
-            info = active.pop(user_id)
-            save_active(active)
-            await update.message.reply_text(f"✅ {info['name']} 下课 🔴")
-            return
-        return
+    display_prize = prize.replace(',', '、').replace('，', '、')
+    msg = f"✅ 抽奖已创建！ID: {lid}\n标题：{title}\n奖品：{display_prize}\n消耗：{cost} 学分\n开奖时间：{draw_time.strftime('%Y-%m-%d %H:%M')}\n"
+    if channel_id:
+        msg += f"📢 参与条件：需关注频道 {channel_id}\n"
+    if need_msgs > 0:
+        msg += f"💬 需群内发言数 ≥ {need_msgs} 条（自创建起统计）\n"
+    msg += f"⏰ 当前服务器时间：{now_cn().strftime('%Y-%m-%d %H:%M')}"
+    await update.message.reply_text(msg)
 
-    if chat_id == GROUP_B_CHAT_ID and text == "出勤":
-        keyboard = get_attendance_buttons("湖州")
-        if keyboard:
-            await update.message.reply_text("湖州同学会出勤：", reply_markup=keyboard)
-        else:
-            await update.message.reply_text("暂无老师")
+async def cmd_list_lotteries(update, ctx):
+    if update.effective_chat.type != 'private':
         return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, title, prize, cost, draw_time, status, winner_id, channel_id, need_msgs, msg_count, winners FROM lotteries ORDER BY id DESC")
+        rows = c.fetchall()
+    if not rows:
+        await update.message.reply_text("暂无抽奖记录。")
+        return
+    status_map = {0: "⏳ 未开始", 1: "🔚 已结束", 2: "🏆 已开奖"}
+    text = "📋 抽奖列表：\n"
+    for row in rows:
+        lid, title, prize, cost, dt, status, winner, channel, need_msgs, msg_count, winners = row
+        status_str = status_map.get(status, "未知")
+        display_prize = prize.replace(',', '、').replace('，', '、')
+        text += f"ID:{lid} | {title} | {display_prize} | 消耗{cost} | {dt} | {status_str}"
+        if channel:
+            text += f" | 频道:{channel}"
+        if need_msgs > 0:
+            text += f" | 需发言≥{need_msgs} (当前{msg_count})"
+        if winners:
+            winner_ids = [int(x) for x in winners.split(',') if x.strip().isdigit()]
+            names = []
+            for wid in winner_ids:
+                with db_connect() as conn2:
+                    c2 = conn2.cursor()
+                    c2.execute("SELECT nickname FROM users WHERE user_id=?", (wid,))
+                    w = c2.fetchone()
+                    names.append(w[0] if w else str(wid))
+            text += f" | 获奖者：{', '.join(names)}"
+        elif winner:
+            with db_connect() as conn2:
+                c2 = conn2.cursor()
+                c2.execute("SELECT nickname FROM users WHERE user_id=?", (winner,))
+                w = c2.fetchone()
+                winner_name = w[0] if w else str(winner)
+            text += f" | 获奖者：{winner_name}"
+        text += "\n"
+    await update.message.reply_text(text)
 
-    if chat_id == GROUP_C_CHAT_ID and text == "出勤":
-        keyboard = get_attendance_buttons("嘉兴")
-        if keyboard:
-            await update.message.reply_text("嘉兴同学会出勤：", reply_markup=keyboard)
-        else:
-            await update.message.reply_text("暂无老师")
+# ========== /qx 取消抽奖 ==========
+async def cmd_cancel_lottery(update, ctx):
+    if update.effective_chat.type != 'private':
         return
-
-# ---------- 自动爱心反应 ----------
-async def auto_heart_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
         return
-    user = update.effective_user
-    if not user or user.id == context.bot.id:
-        return
-    if not get_user_info(user.id):
+    args = ctx.args
+    if len(args) != 1:
+        await update.message.reply_text("用法：/qx <抽奖ID>")
         return
     try:
-        await context.bot.set_message_reaction(
-            chat_id=update.effective_chat.id,
-            message_id=update.message.message_id,
-            reaction=['❤']
-        )
-        logger.info(f"❤️ 已给 {user.id} 的消息加心")
-    except Exception as e:
-        logger.error(f"加心失败: {e}")
-
-# ---------- 定时发送到频道 ----------
-async def send_attendance_to_channel(bot, region: str, channel_key: str):
-    config = load_config()
-    ch_cfg = config[f"channel_{channel_key}"]
-    if not ch_cfg.get("enabled") or not ch_cfg.get("chat_id"):
-        logger.error(f"错误：{region} 频道未设置或未启用")
+        lid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("抽奖ID必须是数字。")
         return
-    chat_id = ch_cfg["chat_id"]
-    keyboard = get_attendance_buttons(region)
-    if not keyboard:
-        text = f"📭 {region}同学会当前暂无登记老师。"
-        try:
-            await bot.send_message(chat_id=chat_id, text=text)
-        except Exception as e:
-            logger.error(f"发送 {region} 出勤到频道失败: {e}")
-    else:
-        try:
-            await bot.send_message(chat_id=chat_id, text=f"📢 {region}同学会定时出勤报告：", reply_markup=keyboard)
-            logger.info(f"已发送 {region} 出勤到频道 {chat_id}")
-            # 更新最后发送时间
-            config[f"last_sent_{channel_key}"] = datetime.now(timezone.utc).isoformat()
-            save_config(config)
-        except Exception as e:
-            logger.error(f"发送 {region} 出勤到频道失败: {e}")
 
-# ---------- 后台任务 ----------
-async def scheduled_tasks(app):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, title, status FROM lotteries WHERE id=?", (lid,))
+        row = c.fetchone()
+        if not row:
+            await update.message.reply_text("抽奖不存在。")
+            return
+        lid, title, status = row
+        if status != 0:
+            await update.message.reply_text("该抽奖已结束或已开奖，无法取消。")
+            return
+        c.execute("UPDATE lotteries SET status=1 WHERE id=?", (lid,))
+        conn.commit()
+    await update.message.reply_text(f"✅ 抽奖「{title}」（ID:{lid}）已取消，不产生获奖者。")
+
+# ========== /gg 修改开奖时间 ==========
+async def cmd_change_time(update, ctx):
+    """修改开奖时间：/gg <抽奖ID> <新时间 YYYY-MM-DD HH:MM>"""
+    if update.effective_chat.type != 'private':
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    text = update.message.text.strip()
+    if text.startswith('/gg'):
+        content = text[3:].strip()
+    else:
+        content = text
+
+    time_pattern = r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})'
+    match = re.search(time_pattern, content)
+    if not match:
+        await update.message.reply_text("未找到有效时间，请使用格式：YYYY-MM-DD HH:MM\n例如：/gg 5 2026-08-18 10:00")
+        return
+    new_time_str = match.group(1)
+
+    parts = content.split()
+    if not parts:
+        await update.message.reply_text("请提供抽奖ID。")
+        return
+    try:
+        lid = int(parts[0])
+    except ValueError:
+        await update.message.reply_text("抽奖ID必须是数字。")
+        return
+
+    try:
+        new_dt = datetime.strptime(new_time_str, "%Y-%m-%d %H:%M")
+        if new_dt <= now_cn():
+            await update.message.reply_text(f"新时间必须在未来。当前时间：{now_cn().strftime('%Y-%m-%d %H:%M')}")
+            return
+    except ValueError:
+        await update.message.reply_text("时间格式无效，请使用 YYYY-MM-DD HH:MM")
+        return
+
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, title, draw_time, status FROM lotteries WHERE id=?", (lid,))
+        row = c.fetchone()
+        if not row:
+            await update.message.reply_text("抽奖不存在。")
+            return
+        lid, title, old_time, status = row
+        if status != 0:
+            await update.message.reply_text("该抽奖已结束或已开奖，无法修改时间。")
+            return
+        c.execute("UPDATE lotteries SET draw_time=? WHERE id=?", (new_dt, lid))
+        conn.commit()
+    await update.message.reply_text(
+        f"✅ 抽奖「{title}」（ID:{lid}）的开奖时间已更新：\n"
+        f"旧时间：{old_time}\n新时间：{new_dt.strftime('%Y-%m-%d %H:%M')}"
+    )
+
+# ========== /QL 清理抽奖数据 ==========
+async def cmd_clean_lottery(update, ctx):
+    if update.effective_chat.type != 'private':
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    args = ctx.args
+    if len(args) != 1:
+        await update.message.reply_text("用法：/QL <抽奖ID>")
+        return
+    try:
+        lid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("抽奖ID必须是数字。")
+        return
+
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, title, status FROM lotteries WHERE id=?", (lid,))
+        row = c.fetchone()
+        if not row:
+            await update.message.reply_text("抽奖不存在。")
+            return
+        lid, title, status = row
+        c.execute("DELETE FROM lottery_participants WHERE lottery_id=?", (lid,))
+        c.execute("UPDATE lotteries SET status=0, winner_id=NULL, winners=NULL, msg_count=0 WHERE id=?", (lid,))
+        conn.commit()
+    await update.message.reply_text(f"✅ 抽奖「{title}」（ID:{lid}）已重置：参与者、获奖者、发言统计已清空，状态恢复为未开始。")
+
+# ========== /sb 取消用户参与（不退还学分） ==========
+async def cmd_remove_user_lottery(update, ctx):
+    if update.effective_chat.type != 'private':
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    args = ctx.args
+    if not args:
+        await update.message.reply_text("用法：/sb <用户ID> 或 /sb @用户名\n例如：/sb 123456789 或 /sb @someone")
+        return
+    user_identifier = args[0]
+    target_uid = None
+    if user_identifier.isdigit():
+        target_uid = int(user_identifier)
+    elif user_identifier.startswith('@'):
+        try:
+            chat = await ctx.bot.get_chat(user_identifier)
+            target_uid = chat.id
+        except Exception:
+            await update.message.reply_text("❌ 无法通过 @用户名 获取用户ID，请直接输入数字ID。")
+            return
+    else:
+        await update.message.reply_text("❌ 请输入有效的用户ID（数字）或 @用户名。")
+        return
+
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT l.id, l.title
+            FROM lottery_participants lp
+            JOIN lotteries l ON lp.lottery_id = l.id
+            WHERE lp.user_id = ? AND l.status = 0
+        """, (target_uid,))
+        rows = c.fetchall()
+        if not rows:
+            await update.message.reply_text(f"用户 {target_uid} 没有参与任何进行中的抽奖。")
+            return
+
+        titles = []
+        for lid, title in rows:
+            c.execute("DELETE FROM lottery_participants WHERE lottery_id=? AND user_id=?", (lid, target_uid))
+            titles.append(title)
+        conn.commit()
+
+    user_name = str(target_uid)
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT nickname FROM users WHERE user_id=?", (target_uid,))
+        row = c.fetchone()
+        if row:
+            user_name = row[0]
+
+    await update.message.reply_text(
+        f"✅ 已取消用户 {user_name}（ID:{target_uid}）在以下抽奖中的参与资格（不退还学分）：\n"
+        f"{', '.join(titles)}"
+    )
+
+# ========== 抽奖核心开奖函数（含向管理员发送中奖ID） ==========
+async def do_draw(lottery_id, bot, force=False):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, title, prize, cost, status, draw_time, channel_id, need_msgs, msg_count FROM lotteries WHERE id=?", (lottery_id,))
+        row = c.fetchone()
+        if not row:
+            return False, "抽奖不存在"
+        lid, title, prize, cost, status, draw_time, channel, need_msgs, msg_count = row
+        if status != 0:
+            return False, "该抽奖已结束或已开奖"
+
+        if need_msgs > 0 and msg_count < need_msgs:
+            return False, f"发言数未达标 ({msg_count}/{need_msgs})，暂不开奖。"
+
+        c.execute("SELECT user_id FROM lottery_participants WHERE lottery_id=?", (lid,))
+        participants = [r[0] for r in c.fetchall()]
+        if not participants:
+            if force:
+                c.execute("UPDATE lotteries SET status=1 WHERE id=?", (lid,))
+                conn.commit()
+                return False, "该抽奖暂无参与者，已强制结束。"
+            else:
+                return False, "暂无参与者，未开奖，等待管理员处理。"
+
+        prize_list = [p.strip() for p in re.split(r'[,，]', prize) if p.strip()]
+        if not prize_list:
+            prize_list = ["未命名奖品"]
+
+        shuffled = participants.copy()
+        random.shuffle(shuffled)
+        winner_count = min(len(prize_list), len(shuffled))
+        winners = shuffled[:winner_count]
+
+        first_winner = winners[0] if winners else None
+        winners_str = ','.join(str(uid) for uid in winners) if winners else ''
+        c.execute("UPDATE lotteries SET status=2, winner_id=?, winners=? WHERE id=?", (first_winner, winners_str, lid))
+        conn.commit()
+
+        winner_links = []
+        for uid in winners:
+            c2 = conn.cursor()
+            c2.execute("SELECT nickname FROM users WHERE user_id=?", (uid,))
+            wrow = c2.fetchone()
+            name = wrow[0] if wrow else str(uid)
+            winner_links.append(f'<a href="tg://user?id={uid}">{name}</a>')
+
+        msg = f"🎉 抽奖开奖结果！\n标题：{title}\n\n"
+        for i, (prize_name, link) in enumerate(zip(prize_list[:winner_count], winner_links)):
+            msg += f"🏆 奖品：{prize_name} → 获奖者：{link}\n"
+        if len(prize_list) > winner_count:
+            msg += f"\n⚠️ 参与者数量不足，剩余 {len(prize_list)-winner_count} 个奖品无人获得。"
+        elif len(participants) > len(prize_list):
+            msg += f"\n🎉 恭喜所有获奖者！"
+        else:
+            msg += f"\n🎉 恭喜所有获奖者！"
+    # 发送到群组
+    for gid in ALLOWED_GROUPS:
+        try:
+            await bot.send_message(chat_id=gid, text=msg, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            print(f"发送开奖结果到 {gid} 失败: {e}")
+
+    # ========== 向管理员发送中奖用户ID ==========
+    if winners:
+        admin_msg = f"🎉 抽奖「{title}」已开奖，中奖用户ID列表：\n"
+        for idx, uid in enumerate(winners):
+            prize_name = prize_list[idx] if idx < len(prize_list) else "未分配奖品"
+            admin_msg += f"奖品：{prize_name} → 用户ID：{uid}\n"
+        for aid in ADMIN_IDS:
+            try:
+                await bot.send_message(chat_id=aid, text=admin_msg)
+            except Exception as e:
+                print(f"发送中奖ID给管理员 {aid} 失败: {e}")
+    # ===================================================
+
+    return True, f"抽奖 {lid} 已开奖，产生 {len(winners)} 位获奖者。"
+
+# ========== 后台自动开奖任务 ==========
+async def auto_draw_loop(bot):
     while True:
         try:
-            # 1. 发送出勤到频道
-            config = load_config()
-            now = datetime.now(timezone.utc)
-            for key, region in [("b", "湖州"), ("c", "嘉兴")]:
-                ch_cfg = config[f"channel_{key}"]
-                if not ch_cfg.get("enabled") or not ch_cfg.get("chat_id"):
+            now = now_cn()
+            with db_connect() as conn:
+                c = conn.cursor()
+                c.execute("SELECT id, draw_time FROM lotteries WHERE status=0")
+                rows = c.fetchall()
+            for lid, draw_time_str in rows:
+                try:
+                    draw_time = datetime.fromisoformat(draw_time_str)
+                except:
                     continue
-                interval = ch_cfg.get("interval_hours", 24)
-                last_sent_str = config.get(f"last_sent_{key}")
-                if last_sent_str:
-                    try:
-                        last_sent = datetime.fromisoformat(last_sent_str)
-                    except:
-                        last_sent = None
-                else:
-                    last_sent = None
-                if not last_sent or (now - last_sent).total_seconds() >= interval * 3600:
-                    await send_attendance_to_channel(app.bot, region, key)
-
-            # 2. 个人有效期自动检查（不删除，只做提醒？但此处不额外处理，已在开课时检查）
-            # 可选择每天发一次过期提醒，但暂不实现。
+                if draw_time <= now and (now - draw_time).total_seconds() <= 120:
+                    success, msg = await do_draw(lid, bot, force=False)
+                    if success:
+                        print(f"自动开奖 {lid}: {msg}")
+                    else:
+                        print(f"自动开奖 {lid}: {msg}")
+                elif draw_time <= now:
+                    pass
         except Exception as e:
-            logger.error(f"定时任务异常: {e}")
+            print(f"自动开奖循环出错: {e}")
         await asyncio.sleep(60)
 
-# ---------- 每日重置任务 ----------
-async def daily_reset_job():
-    RESET_HOUR = 4
-    RESET_MINUTE = 48
-    while True:
-        now_utc = datetime.now(timezone.utc)
-        now_beijing = now_utc + timedelta(hours=8)
-        target_beijing = now_beijing.replace(hour=RESET_HOUR, minute=RESET_MINUTE, second=0, microsecond=0)
-        if now_beijing >= target_beijing:
-            target_beijing += timedelta(days=1)
-        target_utc = target_beijing - timedelta(hours=8)
-        sleep_seconds = (target_utc - now_utc).total_seconds()
-        logger.info(f"当前北京时间: {now_beijing.strftime('%Y-%m-%d %H:%M:%S')}, "
-                    f"下次重置: {target_beijing.strftime('%Y-%m-%d %H:%M:%S')}, "
-                    f"等待 {sleep_seconds/3600:.2f} 小时")
-        await asyncio.sleep(sleep_seconds)
-        reset_active_status()
-        cleanup_inactive_users()
+# ========== 普通命令 ==========
+async def cmd_start(update, ctx):
+    if update.message.from_user.is_bot:
+        return
+    if update.effective_chat.type == 'private':
+        uid = update.effective_user.id
+        if uid in ADMIN_IDS:
+            help_text = (
+                "🤖 管理员指令：\n"
+                "/additem <名称> <价格> <限量> - 添加商品（限量0为无限）\n"
+                "/listitems - 查看商品列表\n"
+                "/delitem <商品ID> - 删除商品\n"
+                "群聊：/学分 +数字 或 /学分 -数字（需回复用户消息）\n"
+                "私聊：/xf 金额（给自己加） 或 /xf @用户名 金额  或 /xf 用户ID 金额（可带正负号）\n"
+                "/coins - 查询自己学分\n"
+                "/shop - 打开商城\n"
+                "/start - 显示本帮助\n"
+                "\n🎰 抽奖管理（私聊）：\n"
+                "/cj <标题> <奖品1,奖品2,...> <消耗学分> <开奖时间> [-c @channel] [-f 发言数] - 创建抽奖\n"
+                "/cjlist - 查看所有抽奖\n"
+                "/qx <抽奖ID> - 取消抽奖\n"
+                "/gg <抽奖ID> <新时间> - 修改开奖时间\n"
+                "/QL <抽奖ID> - 重置抽奖（清空参与者和获奖者）\n"
+                "/sb <用户ID/@用户名> - 取消某人在所有进行中抽奖的参与资格（不退还学分）\n"
+                "\n📦 竞拍管理（私聊）：\n"
+                "/jp <标题> <商品> <起拍价> <结束时间> [-j 最小加价] - 创建竞拍\n"
+                "  例如：/jp 八月惊喜 手办 100 2026-09-08 07:30 -j 10\n"
+                "/qxpm <竞拍ID> - 取消竞拍并退款\n"
+                "/jplist - 查看最近5期获胜者名单\n"
+                "\n群组命令（支持 /竞拍 或 竞拍）：\n"
+                "竞拍 - 列出所有进行中的竞拍详情\n"
+                "竞拍 <金额> - 对最新竞拍出价\n"
+                "竞拍 <ID> <金额> - 对指定竞拍出价\n"
+                "回复机器人发出的竞拍消息并输入数字，可直接对该竞拍出价"
+            )
+            await update.message.reply_text(help_text)
+        else:
+            return
+        return
+    if update.effective_chat.type in ('group', 'supergroup'):
+        if update.effective_chat.id not in ALLOWED_GROUPS:
+            return
+    uid = update.effective_user.id
+    name = update.effective_user.first_name
+    get_user(uid, name)
+    bal = get_coins(uid)
+    link = f'<a href="tg://user?id={uid}">{name}</a>'
+    text = f"我的学分\n用户：{link}\n学分：{bal:.2f}"
+    await update.message.reply_text(text, reply_markup=wallet_kb(), parse_mode=ParseMode.HTML)
 
-# ---------- 主程序 ----------
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+async def cmd_coins(update, ctx):
+    if update.message.from_user.is_bot:
+        return
+    if update.effective_chat.type in ('group', 'supergroup'):
+        if update.effective_chat.id not in ALLOWED_GROUPS:
+            return
+    uid = update.effective_user.id
+    name = update.effective_user.first_name
+    bal = get_coins(uid)
+    link = f'<a href="tg://user?id={uid}">{name}</a>'
+    await update.message.reply_text(f"💰 {link}，你有 {bal:.2f} 学分。", parse_mode=ParseMode.HTML)
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(CallbackQueryHandler(admin_add_region_callback, pattern="^admin_add_region_"))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, private_text_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, group_message_handler))
-    app.add_handler(MessageHandler(filters.ALL, auto_heart_reaction), group=-1)
+async def cmd_shop(update, ctx):
+    if update.message.from_user.is_bot:
+        return
+    if update.effective_chat.type in ('group', 'supergroup'):
+        if update.effective_chat.id not in ALLOWED_GROUPS:
+            return
+    uid = update.effective_user.id
+    name = update.effective_user.first_name
+    get_user(uid, name)
+    bal = get_coins(uid)
+    await update.message.reply_text(
+        f"🛒 学分商城\n💎 当前余额：{bal:.2f} 学分\n点击下方按钮兑换商品：",
+        reply_markup=shop_kb()
+    )
+
+# ========== 消息处理器 ==========
+async def on_msg(update, ctx):
+    if update.message.from_user.is_bot:
+        return
+    if not update.message or not update.message.text:
+        return
+    if update.effective_chat.type in ('group', 'supergroup'):
+        if update.effective_chat.id not in ALLOWED_GROUPS:
+            return
+    text = update.message.text.strip()
+
+    # ---------- 检测回复竞拍消息 ----------
+    if update.message.reply_to_message:
+        replied = update.message.reply_to_message
+        if replied.from_user and replied.from_user.is_bot:
+            if "拍卖第" in replied.text:
+                match = re.search(r'拍卖第(\d+)期', replied.text)
+                if match:
+                    auction_id = int(match.group(1))
+                    reply_text = update.message.text.strip()
+                    num_match = re.search(r'(\d+(?:\.\d+)?)', reply_text)
+                    if num_match:
+                        amount = float(num_match.group(1))
+                        if amount > 0:
+                            uid = update.effective_user.id
+                            name = update.effective_user.first_name
+                            get_user(uid, name)
+                            success, msg = place_bid(uid, auction_id, amount)
+                            await update.message.reply_text(msg)
+                            if success:
+                                auction = get_auction(auction_id)
+                                if auction:
+                                    detail = format_auction_full(auction)
+                                    await update.message.reply_text(detail, parse_mode=ParseMode.HTML)
+                            return
+
+    # 跳过以 / 开头的命令
+    if text.startswith('/'):
+        return
+
+    # ---------- 处理不带斜杠的“竞拍”命令 ----------
+    if text == "竞拍" or text.startswith("竞拍 "):
+        await cmd_bid_or_list(update, ctx)
+        return
+
+    if text == "商城":
+        uid = update.message.from_user.id
+        name = update.message.from_user.first_name
+        get_user(uid, name)
+        bal = get_coins(uid)
+        await update.message.reply_text(
+            f"🛒 学分商城\n💎 当前余额：{bal:.2f} 学分\n点击下方按钮兑换商品：",
+            reply_markup=shop_kb()
+        )
+        return
+    if text == "学分":
+        uid = update.message.from_user.id
+        name = update.message.from_user.first_name
+        bal = get_coins(uid)
+        link = f'<a href="tg://user?id={uid}">{name}</a>'
+        await update.message.reply_text(f"💰 {link}，你的当前余额是 {bal:.2f} 学分。", parse_mode=ParseMode.HTML)
+        return
+    if text == "排行榜":
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT user_id, nickname, coins FROM users ORDER BY coins DESC LIMIT 50")
+            rows = c.fetchall()
+        if not rows:
+            await update.message.reply_text("暂无用户数据。")
+            return
+        msg = "🏆 学分排行榜 (前50)\n"
+        for idx, (uid, nick, coins) in enumerate(rows, 1):
+            name = nick if nick else f"用户{uid}"
+            msg += f"{idx}. {name}: {coins:.2f}学分\n"
+        await update.message.reply_text(msg)
+        return
+
+    # ========== 查看近2天开奖记录 ==========
+    if text == "开奖":
+        now = now_cn()
+        two_days_ago = now - timedelta(days=2)
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT id, title, prize, draw_time, winners
+                FROM lotteries
+                WHERE status = 2 AND draw_time >= ?
+                ORDER BY draw_time DESC
+                LIMIT 20
+            """, (two_days_ago,))
+            rows = c.fetchall()
+        if not rows:
+            await update.message.reply_text("📭 近2天内暂无开奖记录。")
+            return
+        msg = "📋 近2天开奖记录：\n\n"
+        for idx, (lid, title, prize, draw_time, winners_str) in enumerate(rows, 1):
+            prize_list = [p.strip() for p in re.split(r'[,，]', prize) if p.strip()]
+            if not prize_list:
+                prize_list = ["未命名奖品"]
+            winner_ids = []
+            if winners_str:
+                winner_ids = [int(x) for x in winners_str.split(',') if x.strip().isdigit()]
+            items = []
+            for i, p in enumerate(prize_list):
+                if i < len(winner_ids):
+                    wid = winner_ids[i]
+                    with db_connect() as conn2:
+                        c2 = conn2.cursor()
+                        c2.execute("SELECT nickname FROM users WHERE user_id=?", (wid,))
+                        wrow = c2.fetchone()
+                        name = wrow[0] if wrow else str(wid)
+                    winner_link = f'<a href="tg://user?id={wid}">{name}</a>'
+                    items.append(f"{p} → {winner_link}")
+                else:
+                    items.append(f"{p} → ❌ 无人获得")
+            msg += f"{idx}. 🎯 标题：{title}\n"
+            msg += f"   🕒 开奖时间：{draw_time}\n"
+            for item in items:
+                msg += f"   🎁 {item}\n"
+            msg += "\n"
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        return
+
+    # ========== 低保命令 ==========
+    if text == "低保":
+        uid = update.message.from_user.id
+        name = update.message.from_user.first_name
+        get_user(uid, name)
+        bal = get_coins(uid)
+
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT value FROM dice_state WHERE key='current_round'")
+            row = c.fetchone()
+            if row:
+                current_round = int(row[0])
+                if current_round > 0:
+                    c.execute("SELECT 1 FROM dice_bets WHERE round_id=? AND user_id=? AND win IS NULL", (current_round, uid))
+                    if c.fetchone():
+                        await update.message.reply_text("您有进行中的骰子投注，无法领取低保，请等待开奖结果后再试。")
+                        return
+
+        if bal >= 5:
+            await update.message.reply_text("您的学分已达到或超过 5 分，无需领取低保。")
+            return
+        today_count = get_welfare_today_count(uid)
+        if today_count >= 10:
+            await update.message.reply_text("您今天已领取 10 次低保，已达上限，请明天再试。")
+            return
+        add_coins(uid, 5, "每日低保领取")
+        add_welfare_record(uid)
+        new_bal = get_coins(uid)
+        remaining = 10 - (today_count + 1)
+        await update.message.reply_text(
+            f"✅ 低保发放成功！\n"
+            f"您当前余额：{new_bal:.2f} 学分\n"
+            f"今日剩余领取次数：{remaining} 次"
+        )
+        return
+
+    # ========== 抽奖参与 ==========
+    if text == "抽奖":
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT id, title, prize, cost, draw_time, channel_id, need_msgs, msg_count FROM lotteries WHERE status=0 ORDER BY draw_time ASC")
+            rows = c.fetchall()
+        if not rows:
+            await update.message.reply_text("当前没有任何抽奖活动，请关注后续通知。")
+            return
+
+        for lid, title, prize, cost, draw_time, channel_id, need_msgs, msg_count in rows:
+            if isinstance(draw_time, str):
+                draw_time = datetime.fromisoformat(draw_time)
+            expired = now_cn() > draw_time
+            with db_connect() as conn2:
+                c2 = conn2.cursor()
+                c2.execute("SELECT 1 FROM lottery_participants WHERE lottery_id=? AND user_id=?", (lid, update.effective_user.id))
+                already = c2.fetchone() is not None
+                c2.execute("SELECT user_id FROM lottery_participants WHERE lottery_id=?", (lid,))
+                participants = [p[0] for p in c2.fetchall()]
+                names = []
+                for pid in participants:
+                    c3 = conn2.cursor()
+                    c3.execute("SELECT nickname FROM users WHERE user_id=?", (pid,))
+                    nick = c3.fetchone()
+                    names.append(nick[0] if nick else str(pid))
+            btn = Btn("🎟️ 参与抽奖", callback_data=f"lottery_join_{lid}") if not expired else None
+            kb = Markup([[btn]]) if btn else None
+            display_prize = prize.replace(',', '、').replace('，', '、')
+            msg = f"🎰 当前抽奖活动\n标题：{title}\n奖品：{display_prize}\n消耗：{cost} 学分\n开奖时间：{draw_time}\n"
+            if channel_id:
+                msg += f"📢 参与条件：需关注频道 {channel_id}\n"
+            if need_msgs > 0:
+                msg += f"💬 需群内发言数 ≥ {need_msgs} 条（当前 {msg_count} 条）\n"
+            if names:
+                msg += f"👥 已参与（{len(names)}人）：{', '.join(names)}\n"
+            else:
+                msg += "👥 暂无人参与\n"
+            if expired:
+                msg += "⏰ 该抽奖已过开奖时间，无法参与。"
+            else:
+                msg += "点击下方按钮参与！"
+            await update.message.reply_text(msg, reply_markup=kb)
+        return
+
+    # ===== 发言统计 =====
+    with db_connect() as conn:
+        c = conn.cursor()
+        now = now_cn()
+        c.execute("SELECT id, created_at FROM lotteries WHERE status=0 AND need_msgs > 0")
+        rows = c.fetchall()
+    for lid, created_at in rows:
+        try:
+            created_dt = datetime.fromisoformat(created_at) if isinstance(created_at, str) else created_at
+        except:
+            continue
+        if now >= created_dt:
+            with db_connect() as conn2:
+                c2 = conn2.cursor()
+                c2.execute("UPDATE lotteries SET msg_count = msg_count + 1 WHERE id=? AND status=0", (lid,))
+                conn2.commit()
+
+    # ===== 骰子下注 =====
+    dice_match = re.match(r'^押\s+(\S+)\s+(\d+(?:\.\d+)?)$', text) or re.match(r'^押\s+(\d+(?:\.\d+)?)\s+(\S+)$', text)
+    if dice_match:
+        if dice_match.group(1).replace('.', '').isdigit():
+            amount = float(dice_match.group(1))
+            bet_type = dice_match.group(2)
+        else:
+            bet_type = dice_match.group(1)
+            amount = float(dice_match.group(2))
+        valid_bets = ['大', '小', '单', '双', '大单', '大双', '小单', '小双']
+        if bet_type not in valid_bets:
+            await update.message.reply_text("玩法错误，请选择：大、小、单、双、大单、大双、小单、小双")
+            return
+        if amount <= 0:
+            await update.message.reply_text("下注金额必须为正数。")
+            return
+
+        state = get_dice_state()
+        if state['status'] != 'active':
+            rid = create_new_round()
+            chat_id = update.effective_chat.id
+            asyncio.create_task(round_timer(ctx, rid, chat_id))
+            state = get_dice_state()
+            if state['status'] != 'active':
+                await update.message.reply_text("游戏初始化失败，请稍后再试。")
+                return
+
+        round_id = state['round_id']
+        uid = update.message.from_user.id
+        name = update.message.from_user.first_name
+
+        get_user(uid, name)
+        bal = get_coins(uid)
+        if bal < amount:
+            await update.message.reply_text(f"余额不足！你需要 {amount} 学分，当前余额 {bal:.2f}。")
+            return
+        if not sub_coins(uid, amount, f"骰子下注 {bet_type}"):
+            await update.message.reply_text("下注失败，请稍后再试。")
+            return
+
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("INSERT INTO dice_bets (round_id, user_id, amount, bet_type, win) VALUES (?,?,?,?,?)",
+                      (round_id, uid, amount, bet_type, None))
+            conn.commit()
+
+        end_time = datetime.fromisoformat(state['end_time'])
+        remaining_seconds = max(0, int((end_time - now_cn()).total_seconds()))
+        date_str = now_cn().strftime('%m月%d日')
+        rid = round_id
+        bet_example = "押 大 10  押 小 10  押大双 10"
+        status = "🟢投注中"
+        msg = f"🎲苏大骰王 {date_str} 第{rid}期\n"
+        msg += f"💡状态：    {status}\n"
+        msg += f"⏰️距离开奖:{remaining_seconds}秒\n"
+        msg += f"💰投注格式：{bet_example}"
+        await update.message.reply_text(msg)
+        return
+
+    # 普通发言掉落
+    if len(text) < 4:
+        return
+    uid = update.message.from_user.id
+    name = update.message.from_user.first_name
+    get_user(uid, name)
+    today_gain = get_today_gain(uid)
+    base_prob = get_dynamic_drop_prob(today_gain)
+    use_bonus = check_and_use_first_bonus(uid)
+    current_prob = base_prob * TRIPLE_MULTIPLIER if use_bonus else base_prob
+    current_prob = min(current_prob, 1.0)
+    if random.random() < current_prob:
+        coin = rand_coin()
+        add_coins(uid, coin, "发言掉落")
+        add_today_gain(uid, coin)
+        bal = get_coins(uid)
+        link = f'<a href="tg://user?id={uid}">{name}</a>'
+        await update.message.reply_text(
+            f"🧧恭喜 {link} 中奖！\n💰获得：{coin:.2f} 学分\n📚余额：{bal:.2f} 学分\n💡发送「商城」可兑换商品",
+            parse_mode=ParseMode.HTML
+        )
+
+# ========== 骰子游戏核心 ==========
+DICE_INTERVAL = 180
+RAKE = 0.10
+
+def get_dice_state():
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT value FROM dice_state WHERE key='current_round'")
+        row = c.fetchone()
+        rid = int(row[0]) if row else 0
+        c.execute("SELECT value FROM dice_state WHERE key='end_time'")
+        row = c.fetchone()
+        end_time_str = row[0] if row else ''
+        status = 'active' if end_time_str and now_cn() < datetime.fromisoformat(end_time_str) else 'inactive'
+        return {'round_id': rid, 'end_time': end_time_str, 'status': status}
+
+def create_new_round():
+    with db_connect() as conn:
+        c = conn.cursor()
+        now = now_cn()
+        end_time = now + timedelta(seconds=DICE_INTERVAL)
+        c.execute("INSERT INTO dice_rounds (start_time, end_time, numbers, total, result, total_bets) VALUES (?, ?, ?, ?, ?, ?)",
+                  (now, end_time, None, None, None, 0))
+        rid = c.lastrowid
+        c.execute("REPLACE INTO dice_state (key, value) VALUES ('current_round', ?)", (str(rid),))
+        c.execute("REPLACE INTO dice_state (key, value) VALUES ('end_time', ?)", (end_time.isoformat(),))
+        conn.commit()
+        print(f"创建新轮: rid={rid}, end_time={end_time.isoformat()}")
+        return rid
+
+def close_round(rid, numbers, total, result, total_bets):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE dice_rounds SET numbers=?, total=?, result=?, total_bets=? WHERE id=?",
+                  (numbers, total, result, total_bets, rid))
+        conn.commit()
+
+def get_bets_for_round(rid):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT user_id, amount, bet_type FROM dice_bets WHERE round_id=? AND win IS NULL", (rid,))
+        return c.fetchall()
+
+def update_bet_win(rid, uid, win_amount):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE dice_bets SET win=? WHERE round_id=? AND user_id=?", (win_amount, rid, uid))
+        conn.commit()
+
+def get_dice_win_rate(uid):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM dice_bets WHERE user_id=? AND win IS NOT NULL", (uid,))
+        total = c.fetchone()[0]
+        if total == 0:
+            return 0, 0
+        c.execute("SELECT COUNT(*) FROM dice_bets WHERE user_id=? AND win > 0", (uid,))
+        wins = c.fetchone()[0]
+        return wins, total
+
+def generate_dice_numbers():
+    return [random.randint(0, 9) for _ in range(3)]
+
+async def round_timer(context, rid, chat_id):
+    print(f"定时器启动，等待 {DICE_INTERVAL} 秒后结算第{rid}期")
+    await asyncio.sleep(DICE_INTERVAL)
+    print(f"定时器触发，结算第{rid}期")
+    await settle_round(context, rid, chat_id)
+
+async def settle_round(context, rid, chat_id):
+    print(f">>> 结算第{rid}期")
+    bets = get_bets_for_round(rid)
+    if not bets:
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("UPDATE dice_rounds SET end_time=?, numbers='', total=0, result='无人下注', total_bets=0 WHERE id=?", (now_cn(), rid))
+            conn.commit()
+        await context.bot.send_message(chat_id=chat_id, text=f"🎲 苏大骰王 第{rid}期 无人下注，已结束。")
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM dice_bets WHERE round_id = ?", (rid,))
+            c.execute("DELETE FROM dice_rounds WHERE id = ?", (rid,))
+            conn.commit()
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("REPLACE INTO dice_state (key, value) VALUES ('current_round', '0')")
+            c.execute("REPLACE INTO dice_state (key, value) VALUES ('end_time', '')")
+            conn.commit()
+        return
+    numbers = generate_dice_numbers()
+    total = sum(numbers)
+    is_big = total >= 14
+    is_odd = total % 2 == 1
+    result_type = []
+    if is_big:
+        result_type.append('大')
+    else:
+        result_type.append('小')
+    if is_odd:
+        result_type.append('单')
+    else:
+        result_type.append('双')
+    result_combined = ''.join(result_type)
+    winners = []
+    for uid, amount, bet_type in bets:
+        win = 0
+        if bet_type in ['大', '小', '单', '双']:
+            if bet_type in result_type:
+                win = amount
+        elif bet_type in ['大单', '大双', '小单', '小双']:
+            if bet_type == result_combined:
+                win = amount * 3
+        if win > 0:
+            win_after_rake = win * (1 - RAKE)
+            add_coins(uid, amount + win_after_rake, f"骰子中奖 {bet_type}")
+            winners.append((uid, amount, bet_type, win_after_rake))
+            update_bet_win(rid, uid, win_after_rake)
+        else:
+            update_bet_win(rid, uid, 0.0)
+    close_round(rid, '-'.join(map(str, numbers)), total, result_combined, len(bets))
+    date_str = now_cn().strftime('%m月%d日')
+    result_msg = f"<b>🎲 苏大骰王  {date_str} 第{rid}期 开奖结果</b>\n"
+    result_msg += f"🎯号码：{' + '.join(map(str, numbers))} = {total}\n"
+    result_msg += f"📋结果：<b>{result_combined}</b>\n\n"
+    if winners:
+        result_msg += "🏆 中奖名单：\n"
+        for uid, amount, bet_type, win in winners:
+            with db_connect() as conn:
+                c = conn.cursor()
+                c.execute("SELECT nickname FROM users WHERE user_id=?", (uid,))
+                row = c.fetchone()
+                name = row[0] if row else str(uid)
+            link = f'<a href="tg://user?id={uid}">{name}</a>'
+            result_msg += f"  {link} 押{bet_type}{amount}学分 → +{win:.2f}学分\n"
+    else:
+        result_msg += "😭本期无人中奖\n"
+    result_msg += "\n⏰下一期即将开始，请下注"
+    await context.bot.send_message(chat_id=chat_id, text=result_msg, parse_mode=ParseMode.HTML)
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM dice_bets WHERE round_id = ?", (rid,))
+        c.execute("DELETE FROM dice_rounds WHERE id = ?", (rid,))
+        conn.commit()
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("REPLACE INTO dice_state (key, value) VALUES ('current_round', '0')")
+        c.execute("REPLACE INTO dice_state (key, value) VALUES ('end_time', '')")
+        conn.commit()
+
+async def dice_stats(update, ctx):
+    if update.message.from_user.is_bot:
+        return
+    uid = update.effective_user.id
+    wins, total = get_dice_win_rate(uid)
+    if total == 0:
+        await update.message.reply_text("您还没有参与过骰子游戏记录。")
+    else:
+        rate = wins / total * 100
+        await update.message.reply_text(f"🎲 您的骰子战绩：\n胜场：{wins}\n总局数：{total}\n胜率：{rate:.1f}%")
+
+# ============================================================
+# ========== 竞拍模块 ==========
+# ============================================================
+
+def init_auction_tables():
+    """创建竞拍相关表"""
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS auctions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_name TEXT NOT NULL,
+                description TEXT,
+                starting_price REAL NOT NULL,
+                current_price REAL NOT NULL,
+                current_bidder_id INTEGER,
+                end_time TIMESTAMP NOT NULL,
+                status INTEGER DEFAULT 0,
+                created_by INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                min_increment REAL DEFAULT 0
+            )
+        """)
+        c.execute("PRAGMA table_info(auctions)")
+        existing_cols = [col[1] for col in c.fetchall()]
+        if "min_increment" not in existing_cols:
+            c.execute("ALTER TABLE auctions ADD COLUMN min_increment REAL DEFAULT 0")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS bids (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                auction_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                amount REAL NOT NULL,
+                time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_bids_auction ON bids(auction_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_bids_user ON bids(user_id)")
+        conn.commit()
+
+# ---------- 核心竞拍函数 ----------
+def create_auction(creator_id, item_name, description, starting_price, end_time, min_increment=0):
+    if starting_price <= 0:
+        raise ValueError("起拍价必须大于0")
+    if end_time <= now_cn():
+        raise ValueError("结束时间必须在未来")
+    if min_increment < 0:
+        raise ValueError("最小加价不能为负数")
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO auctions (item_name, description, starting_price, current_price, current_bidder_id, end_time, status, created_by, min_increment)
+            VALUES (?, ?, ?, ?, NULL, ?, 0, ?, ?)
+        """, (item_name, description, starting_price, starting_price, end_time, creator_id, min_increment))
+        auction_id = c.lastrowid
+        conn.commit()
+    return auction_id
+
+def get_auction(auction_id):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, item_name, description, starting_price, current_price, current_bidder_id,
+                   end_time, status, created_by, created_at, min_increment
+            FROM auctions WHERE id=?
+        """, (auction_id,))
+        row = c.fetchone()
+        if not row:
+            return None
+        return {
+            'id': row[0],
+            'item_name': row[1],
+            'description': row[2],
+            'starting_price': row[3],
+            'current_price': row[4],
+            'current_bidder_id': row[5],
+            'end_time': datetime.fromisoformat(row[6]) if isinstance(row[6], str) else row[6],
+            'status': row[7],
+            'created_by': row[8],
+            'created_at': row[9],
+            'min_increment': row[10] if len(row) > 10 else 0
+        }
+
+def list_active_auctions(limit=10):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, item_name, current_price, current_bidder_id, end_time, starting_price, description, min_increment
+            FROM auctions
+            WHERE status=0 AND end_time > ?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (now_cn(), limit))
+        rows = c.fetchall()
+    result = []
+    for row in rows:
+        result.append({
+            'id': row[0],
+            'item_name': row[1],
+            'current_price': row[2],
+            'current_bidder_id': row[3],
+            'end_time': datetime.fromisoformat(row[4]) if isinstance(row[4], str) else row[4],
+            'starting_price': row[5],
+            'description': row[6],
+            'min_increment': row[7] if len(row) > 7 else 0
+        })
+    return result
+
+def get_bid_history(auction_id, limit=10):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT b.user_id, b.amount, b.time, u.nickname
+            FROM bids b
+            LEFT JOIN users u ON b.user_id = u.user_id
+            WHERE b.auction_id = ?
+            ORDER BY b.time DESC
+            LIMIT ?
+        """, (auction_id, limit))
+        rows = c.fetchall()
+    history = []
+    for uid, amount, time, nickname in rows:
+        history.append({
+            'user_id': uid,
+            'amount': amount,
+            'time': datetime.fromisoformat(time) if isinstance(time, str) else time,
+            'nickname': nickname or str(uid)
+        })
+    return history
+
+def place_bid(uid, auction_id, amount):
+    auction = get_auction(auction_id)
+    if not auction:
+        return False, "竞拍不存在"
+    if auction['status'] != 0:
+        return False, "该竞拍已结束或已取消"
+    if auction['end_time'] <= now_cn():
+        return False, "该竞拍已过期"
+
+    current_price = auction['current_price']
+    current_bidder = auction['current_bidder_id']
+    min_increment = auction.get('min_increment', 0)
+
+    if current_bidder is None:
+        if amount < auction['starting_price']:
+            return False, f"出价不能低于起拍价 {auction['starting_price']} 学分"
+    else:
+        if amount <= current_price:
+            return False, f"出价必须高于当前价格 {current_price} 学分"
+        if min_increment > 0 and (amount - current_price) < min_increment:
+            return False, f"每次加价至少 {min_increment} 学分"
+
+    balance = get_coins(uid)
+    if balance < amount:
+        return False, f"余额不足，需要 {amount} 学分，当前余额 {balance:.2f}"
+
+    with db_connect() as conn:
+        c = conn.cursor()
+        try:
+            c.execute("UPDATE users SET coins = coins - ? WHERE user_id=?", (amount, uid))
+            if c.rowcount == 0:
+                return False, "用户不存在"
+            c.execute("INSERT INTO bids (auction_id, user_id, amount) VALUES (?, ?, ?)",
+                      (auction_id, uid, amount))
+            if current_bidder is not None:
+                c.execute("UPDATE users SET coins = coins + ? WHERE user_id=?", (current_price, current_bidder))
+                c.execute("INSERT INTO tx (user_id, type, amount, desc, ts) VALUES (?,?,?,?,?)",
+                          (current_bidder, "收入", current_price, f"竞拍 #{auction_id} 被超过退还", now_cn()))
+            c.execute("UPDATE auctions SET current_price=?, current_bidder_id=? WHERE id=?",
+                      (amount, uid, auction_id))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            return False, f"数据库错误: {e}"
+
+    with db_connect() as conn2:
+        c2 = conn2.cursor()
+        c2.execute("INSERT INTO tx (user_id, type, amount, desc, ts) VALUES (?,?,?,?,?)",
+                   (uid, "支出", amount, f"竞拍 #{auction_id} 出价", now_cn()))
+        conn2.commit()
+
+    return True, f"出价成功，当前最高价 {amount} 学分"
+
+def end_auction(auction_id, force=False):
+    auction = get_auction(auction_id)
+    if not auction:
+        return False, "竞拍不存在"
+    if auction['status'] != 0:
+        return False, "该竞拍已结束或已取消"
+    if not force and auction['end_time'] > now_cn():
+        return False, "竞拍尚未结束，请等待到期或使用强制结束"
+
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE auctions SET status=1 WHERE id=?", (auction_id,))
+        conn.commit()
+
+    winner_id = auction['current_bidder_id']
+    if winner_id:
+        with db_connect() as conn2:
+            c2 = conn2.cursor()
+            c2.execute("SELECT nickname FROM users WHERE user_id=?", (winner_id,))
+            row = c2.fetchone()
+            winner_name = row[0] if row else str(winner_id)
+        winner_link = f'<a href="tg://user?id={winner_id}">{winner_name}</a>'
+        msg = f"🏆 竞拍 #{auction_id} 「{auction['item_name']}」已结束，获胜者为 {winner_link}，成交价 {auction['current_price']} 学分。"
+    else:
+        msg = f"📢 竞拍 #{auction_id} 「{auction['item_name']}」已结束，无人出价，流拍。"
+    return True, msg
+
+def cancel_auction(auction_id):
+    auction = get_auction(auction_id)
+    if not auction:
+        return False, "竞拍不存在"
+    if auction['status'] != 0:
+        return False, "该竞拍已结束或已取消"
+
+    current_bidder = auction['current_bidder_id']
+    current_price = auction['current_price']
+    with db_connect() as conn:
+        c = conn.cursor()
+        if current_bidder is not None:
+            c.execute("UPDATE users SET coins = coins + ? WHERE user_id=?", (current_price, current_bidder))
+            c.execute("INSERT INTO tx (user_id, type, amount, desc, ts) VALUES (?,?,?,?,?)",
+                      (current_bidder, "收入", current_price, f"竞拍 #{auction_id} 取消退款", now_cn()))
+        c.execute("UPDATE auctions SET status=2 WHERE id=?", (auction_id,))
+        conn.commit()
+    return True, f"竞拍 #{auction_id} 已取消，{f'已退还 {current_price} 学分给出价人' if current_bidder else '无出价记录'}"
+
+# ---------- 格式化美化竞拍信息 ----------
+def format_auction_full(auction):
+    lines = []
+    lines.append(f"🏷️ **苏大拍卖第{auction['id']}期**  截止: {auction['end_time'].strftime('%Y-%m-%d %H:%M')}")
+    lines.append(f"📌 标题：{auction['description'] or '无'}")
+    lines.append(f"📦 商品：{auction['item_name']}")
+    lines.append(f"💰 起拍价：{auction['starting_price']} 学分")
+    if auction.get('min_increment', 0) > 0:
+        lines.append(f"📈 最小加价：{auction['min_increment']} 学分")
+    lines.append(f"💎 当前价：{auction['current_price']} 学分")
+
+    bidder_id = auction['current_bidder_id']
+    if bidder_id:
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT nickname FROM users WHERE user_id=?", (bidder_id,))
+            row = c.fetchone()
+            name = row[0] if row else str(bidder_id)
+        lines.append(f"👑 最高价：<a href='tg://user?id={bidder_id}'>{name}</a>")
+    else:
+        lines.append("👑 最高价：暂无")
+
+    history = get_bid_history(auction['id'], limit=10)
+    if history:
+        lines.append("📜 **出价记录（最近10条）**：")
+        for idx, rec in enumerate(history, 1):
+            user_link = f"<a href='tg://user?id={rec['user_id']}'>{rec['nickname']}</a>"
+            time_str = rec['time'].strftime('%m-%d %H:%M')
+            lines.append(f"  {idx}. {user_link} 出价 {rec['amount']} 学分  ({time_str})")
+    else:
+        lines.append("📜 暂无出价记录")
+
+    return "\n".join(lines)
+
+# ---------- 竞拍命令 ----------
+async def cmd_jp(update, ctx):
+    if update.effective_chat.type != 'private':
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+
+    args = ctx.args
+    if len(args) < 5:
+        await update.message.reply_text(
+            "用法：/jp <标题> <商品> <起拍价> <结束时间> [-j 最小加价]\n"
+            "结束时间格式：YYYY-MM-DD HH:MM\n"
+            "示例：/jp 八月惊喜 手办 100 2026-09-08 07:30 -j 10"
+        )
+        return
+
+    min_increment = 0
+    clean_args = []
+    i = 0
+    while i < len(args):
+        if args[i] == '-j':
+            if i + 1 < len(args):
+                try:
+                    min_increment = float(args[i+1])
+                    if min_increment < 0:
+                        min_increment = 0
+                    i += 2
+                    continue
+                except ValueError:
+                    pass
+            await update.message.reply_text("❌ -j 参数后必须跟正数")
+            return
+        clean_args.append(args[i])
+        i += 1
+
+    if len(clean_args) < 4:
+        await update.message.reply_text("参数不足，请检查格式。")
+        return
 
     try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        starting_price = float(clean_args[-3])
+        if starting_price <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("起拍价必须为正数数字。")
+        return
 
-    loop.create_task(daily_reset_job())
-    loop.create_task(scheduled_tasks(app))
+    time_str = clean_args[-2] + ' ' + clean_args[-1]
+    try:
+        end_time = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
+    except ValueError:
+        await update.message.reply_text("结束时间格式无效，请使用 YYYY-MM-DD HH:MM")
+        return
+    if end_time <= now_cn():
+        await update.message.reply_text(f"结束时间必须在未来。当前时间：{now_cn().strftime('%Y-%m-%d %H:%M')}")
+        return
 
-    logger.info("机器人已启动（数据持久化目录: %s）", DATA_DIR)
-    logger.info(f"开课群: {GROUP_A_CHAT_ID} | 湖州群: {GROUP_B_CHAT_ID} | 嘉兴群: {GROUP_C_CHAT_ID}")
+    title = clean_args[0]
+    item_name = ' '.join(clean_args[1:-3]) if len(clean_args) > 4 else "未命名商品"
+
+    try:
+        auction_id = create_auction(update.effective_user.id, item_name, title, starting_price, end_time, min_increment)
+        await update.message.reply_text(
+            f"✅ 竞拍创建成功！\n"
+            f"ID: {auction_id}\n"
+            f"标题：{title}\n"
+            f"商品：{item_name}\n"
+            f"起拍价：{starting_price} 学分\n"
+            f"最小加价：{min_increment} 学分\n"
+            f"结束时间：{end_time.strftime('%Y-%m-%d %H:%M')}\n"
+            f"群组中使用「竞拍」或「/竞拍」参与。"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ 创建失败：{e}")
+
+async def cmd_bid_or_list(update, ctx):
+    if update.effective_chat.type not in ('group', 'supergroup'):
+        return
+    if update.effective_chat.id not in ALLOWED_GROUPS:
+        await update.message.reply_text("该群组未授权使用本机器人。")
+        return
+
+    text = update.message.text.strip()
+    if text.startswith('/竞拍'):
+        cmd_part = '/竞拍'
+    elif text.startswith('竞拍'):
+        cmd_part = '竞拍'
+    else:
+        return
+
+    parts = text.split()
+    if len(parts) > 0 and parts[0].startswith(cmd_part):
+        args = parts[1:]
+    else:
+        args = []
+
+    if not args:
+        auctions = list_active_auctions()
+        if not auctions:
+            await update.message.reply_text("当前没有进行中的竞拍。")
+            return
+        for a in auctions:
+            detail = format_auction_full(a)
+            await update.message.reply_text(detail, parse_mode=ParseMode.HTML)
+        return
+
+    uid = update.effective_user.id
+    name = update.effective_user.first_name
+    get_user(uid, name)
+
+    if len(args) == 1:
+        amount_str = args[0]
+        try:
+            amount = float(amount_str)
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("金额必须为正数。")
+            return
+
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT id FROM auctions
+                WHERE status=0 AND end_time > ?
+                ORDER BY id DESC LIMIT 1
+            """, (now_cn(),))
+            row = c.fetchone()
+        if not row:
+            await update.message.reply_text("当前没有进行中的竞拍，无法出价。")
+            return
+        auction_id = row[0]
+    elif len(args) == 2:
+        try:
+            auction_id = int(args[0])
+            amount = float(args[1])
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("竞拍ID和金额必须为正数。")
+            return
+    else:
+        await update.message.reply_text("用法：竞拍 <金额> 或 竞拍 <竞拍ID> <金额>")
+        return
+
+    success, msg = place_bid(uid, auction_id, amount)
+    await update.message.reply_text(msg)
+    if success:
+        auction = get_auction(auction_id)
+        if auction:
+            detail = format_auction_full(auction)
+            await update.message.reply_text(detail, parse_mode=ParseMode.HTML)
+
+async def cmd_qxpm(update, ctx):
+    if update.effective_chat.type != 'private':
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+
+    args = ctx.args
+    if len(args) != 1:
+        await update.message.reply_text("用法：/qxpm <竞拍ID>")
+        return
+    try:
+        auction_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("竞拍ID必须是数字。")
+        return
+
+    success, msg = cancel_auction(auction_id)
+    await update.message.reply_text(msg)
+
+async def cmd_jplist(update, ctx):
+    if update.effective_chat.type != 'private':
+        return
+
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT id, item_name, current_price, current_bidder_id
+            FROM auctions
+            WHERE status = 1 AND current_bidder_id IS NOT NULL
+            ORDER BY id DESC
+            LIMIT 5
+        """)
+        rows = c.fetchall()
+
+    if not rows:
+        await update.message.reply_text("📭 暂无已结束的竞拍记录。")
+        return
+
+    lines = ["🏆 最近5期获胜者名单：\n"]
+    for idx, (aid, item, price, winner_id) in enumerate(rows, 1):
+        with db_connect() as conn2:
+            c2 = conn2.cursor()
+            c2.execute("SELECT nickname FROM users WHERE user_id=?", (winner_id,))
+            row = c2.fetchone()
+            winner_name = row[0] if row else str(winner_id)
+        winner_link = f'<a href="tg://user?id={winner_id}">{winner_name}</a>'
+        lines.append(f"{idx}. 第{aid}期 「{item}」 → 获胜者 {winner_link}，成交价 {price} 学分")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+# ---------- 后台自动结束竞拍任务 ----------
+async def auto_end_auctions_loop(bot):
+    while True:
+        try:
+            with db_connect() as conn:
+                c = conn.cursor()
+                c.execute("SELECT id FROM auctions WHERE status=0 AND end_time <= ?", (now_cn(),))
+                rows = c.fetchall()
+            for (auction_id,) in rows:
+                success, msg = end_auction(auction_id, force=False)
+                if success:
+                    for gid in ALLOWED_GROUPS:
+                        try:
+                            await bot.send_message(chat_id=gid, text=msg, parse_mode=ParseMode.HTML)
+                        except Exception as e:
+                            print(f"发送竞拍结束通知到 {gid} 失败: {e}")
+                    print(f"自动结束竞拍 {auction_id}: {msg}")
+                else:
+                    print(f"自动结束竞拍 {auction_id} 失败: {msg}")
+        except Exception as e:
+            print(f"自动结束竞拍循环出错: {e}")
+        await asyncio.sleep(60)
+
+# ========== 启动钩子 ==========
+async def on_startup(app):
+    """机器人启动后在正确的循环中启动后台任务"""
+    app.bot_data['tasks'] = [
+        asyncio.create_task(auto_draw_loop(app.bot)),
+        asyncio.create_task(auto_end_auctions_loop(app.bot)),
+    ]
+
+async def on_shutdown(app):
+    """机器人关闭时优雅取消后台任务，消除警告"""
+    for t in app.bot_data.get('tasks', []):
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+
+# ========== 启动 ==========
+def main():
+    init_db()
+    init_auction_tables()
+
+    app = Application.builder() \
+        .token(TOKEN) \
+        .post_init(on_startup) \
+        .post_shutdown(on_shutdown) \
+        .build()
+
+    # 群聊中的 /学分 由 MessageHandler 处理（保留原有）
+    app.add_handler(MessageHandler(filters.Regex(r'^/学分'), admin_credit_handler))
+    # 私聊中的 /xf 命令（用于私聊加学分）
+    app.add_handler(CommandHandler("xf", admin_credit_private, filters=filters.ChatType.PRIVATE))
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("coins", cmd_coins))
+    app.add_handler(CommandHandler("shop", cmd_shop))
+    app.add_handler(MessageHandler(filters.Regex(r'^骰子战绩$'), dice_stats))
+    app.add_handler(CommandHandler("dice_stats", dice_stats))
+
+    # 竞拍命令（支持 /竞拍 和 竞拍 两种）
+    app.add_handler(MessageHandler(filters.Regex(r'^/竞拍\b'), cmd_bid_or_list))
+
+    # 通用消息处理器
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_msg))
+
+    app.add_handler(CallbackQueryHandler(cb))
+    app.add_handler(CommandHandler("test", test_callback))
+    app.add_handler(CallbackQueryHandler(test_cb, pattern="^test$"))
+    app.add_handler(CommandHandler("additem", admin_add_item))
+    app.add_handler(CommandHandler("listitems", admin_list_items))
+    app.add_handler(CommandHandler("delitem", admin_del_item))
+    app.add_handler(CommandHandler("cj", cmd_create_lottery))
+    app.add_handler(CommandHandler("cjlist", cmd_list_lotteries))
+    app.add_handler(CommandHandler("qx", cmd_cancel_lottery))
+    app.add_handler(CommandHandler("gg", cmd_change_time))
+    app.add_handler(CommandHandler("ql", cmd_clean_lottery))
+    app.add_handler(CommandHandler("sb", cmd_remove_user_lottery))
+
+    # 竞拍其他命令（私聊）
+    app.add_handler(CommandHandler("jp", cmd_jp, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("qxpm", cmd_qxpm, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("jplist", cmd_jplist, filters=filters.ChatType.PRIVATE))
+
     app.run_polling(allowed_updates=["message", "callback_query"])
 
 if __name__ == "__main__":
