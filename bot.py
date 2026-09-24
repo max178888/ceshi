@@ -1484,7 +1484,6 @@ async def round_timer(context, rid, chat_id):
     await settle_round(context, rid, chat_id)
 
 async def settle_round(context, rid, chat_id):
-async def settle_round(context, rid, chat_id):
     print(f">>> 结算第{rid}期")
     bets = get_bets_for_round(rid)
     if not bets:
