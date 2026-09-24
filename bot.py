@@ -581,7 +581,95 @@ async def admin_list_items(update, ctx):
         else:
             text += f"ID:{gid} {name} - {price}💎 (剩余{rem})\n"
     await update.message.reply_text(text)
+    
+# ========== 私聊管理员加学分（命令 /xf） ==========
+async def admin_credit_private(update, ctx):
+    """私聊处理 /xf @用户名 金额 或 /xf 用户ID 金额 或 /xf 金额（给自己加）"""
+    if update.effective_chat.type != 'private':
+        return
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    args = ctx.args
+    if len(args) == 0:
+        await update.message.reply_text(
+            "格式错误，请使用：\n"
+            "/xf 金额（给自己加）\n"
+            "/xf @用户名 金额\n"
+            "/xf 用户ID 金额\n"
+            "金额可带正负号，如 +100 或 -50"
+        )
+        return
+    # 如果只有一个参数，认为是金额，给自己加
+    if len(args) == 1:
+        delta_str = args[0]
+        try:
+            delta = float(delta_str)
+        except ValueError:
+            await update.message.reply_text("金额格式无效，请输入数字。")
+            return
+        target_uid = user_id
+        target_name = update.effective_user.first_name or str(target_uid)
+        get_user(target_uid, target_name)
+        add_coins(target_uid, delta, reason=f"管理员 {user_id} 给自己加学分")
+        new_balance = get_coins(target_uid)
+        action = "增加" if delta > 0 else "扣除"
+        await update.message.reply_text(
+            f"✅ 已为自己 {action} {abs(delta):.2f} 学分\n"
+            f"📚 当前余额：{new_balance:.2f} 学分"
+        )
+        return
 
+    # 两个参数：用户标识 + 金额
+    if len(args) != 2:
+        await update.message.reply_text(
+            "格式错误，请使用：\n"
+            "/xf 金额（给自己加）\n"
+            "/xf @用户名 金额\n"
+            "/xf 用户ID 金额\n"
+            "金额可带正负号，如 +100 或 -50"
+        )
+        return
+    target_identifier = args[0]
+    delta_str = args[1]
+    try:
+        delta = float(delta_str)
+    except ValueError:
+        await update.message.reply_text("金额格式无效，请输入数字。")
+        return
+
+    # 解析目标用户ID
+    target_uid = None
+    target_name = None
+    if target_identifier.startswith('@'):
+        try:
+            chat = await ctx.bot.get_chat(target_identifier)
+            target_uid = chat.id
+            target_name = chat.first_name or str(target_uid)
+        except Exception:
+            await update.message.reply_text(f"❌ 无法找到用户 {target_identifier}，请确认用户名正确或使用数字ID。")
+            return
+    else:
+        try:
+            target_uid = int(target_identifier)
+            try:
+                chat = await ctx.bot.get_chat(target_uid)
+                target_name = chat.first_name or str(target_uid)
+            except:
+                target_name = str(target_uid)
+        except ValueError:
+            await update.message.reply_text("❌ 用户ID必须是数字。")
+            return
+
+    get_user(target_uid, target_name)
+    add_coins(target_uid, delta, reason=f"管理员 {user_id} 私聊操作")
+    new_balance = get_coins(target_uid)
+    action = "增加" if delta > 0 else "扣除"
+    await update.message.reply_text(
+        f"✅ 已为 {target_name} (ID: {target_uid}) {action} {abs(delta):.2f} 学分\n"
+        f"📚 当前余额：{new_balance:.2f} 学分"
+    )
 async def admin_del_item(update, ctx):
     if update.effective_chat.type != 'private':
         return
