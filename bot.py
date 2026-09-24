@@ -139,7 +139,6 @@ def init_db():
                 PRIMARY KEY (user_id, date)
             )
         """)
-        # 为 dice_bets 增加 chat_id 列（若不存在）
         c.execute("PRAGMA table_info(dice_bets)")
         dice_cols = [col[1] for col in c.fetchall()]
         if "chat_id" not in dice_cols:
@@ -750,4 +749,10 @@ async def cmd_list_lotteries(update, ctx):
         lid, title, prize, cost, dt, status, winner, channel, need_msgs, msg_count, winners = row
         status_str = status_map.get(status, "未知")
         display_prize = prize.replace(',', '、').replace('，', '、')
-        text += f"ID:{lid} | {
+        text += f"ID:{lid} | {title} | {display_prize} | 消耗{cost} | {dt} | {status_str}"
+        if channel:
+            text += f" | 频道:{channel}"
+        if need_msgs > 0:
+            text += f" | 需发言≥{need_msgs} (当前{msg_count})"
+        if winners:
+            winner_ids = [int(x) for x in winners.split(',')
