@@ -771,11 +771,4 @@ async def cmd_create_lottery(update, ctx):
         prize_raw = ' '.join(parts[1:-1])
     else:
         prize_raw = "未命名奖品"
-    prize = prize_raw
-
-    if channel_id:
-        try:
-            chat = await ctx.bot.get_chat(channel_id)
-            try:
-                me = await ctx.bot.get_me()
-                member
+    prize =
