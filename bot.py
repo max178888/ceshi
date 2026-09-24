@@ -500,7 +500,8 @@ async def test_cb(update, ctx):
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("✅ 回调测试成功！")
-    # ========== 管理员命令 ==========
+
+# ========== 管理员命令 ==========
 async def admin_credit_handler(update, ctx):
     if update.effective_chat.type not in ('group', 'supergroup'):
         return
@@ -581,7 +582,7 @@ async def admin_list_items(update, ctx):
         else:
             text += f"ID:{gid} {name} - {price}💎 (剩余{rem})\n"
     await update.message.reply_text(text)
-    
+
 # ========== 私聊管理员加学分（命令 /xf） ==========
 async def admin_credit_private(update, ctx):
     """私聊处理 /xf @用户名 金额 或 /xf 用户ID 金额 或 /xf 金额（给自己加）"""
@@ -601,7 +602,6 @@ async def admin_credit_private(update, ctx):
             "金额可带正负号，如 +100 或 -50"
         )
         return
-    # 如果只有一个参数，认为是金额，给自己加
     if len(args) == 1:
         delta_str = args[0]
         try:
@@ -621,7 +621,6 @@ async def admin_credit_private(update, ctx):
         )
         return
 
-    # 两个参数：用户标识 + 金额
     if len(args) != 2:
         await update.message.reply_text(
             "格式错误，请使用：\n"
@@ -639,7 +638,6 @@ async def admin_credit_private(update, ctx):
         await update.message.reply_text("金额格式无效，请输入数字。")
         return
 
-    # 解析目标用户ID
     target_uid = None
     target_name = None
     if target_identifier.startswith('@'):
@@ -670,6 +668,7 @@ async def admin_credit_private(update, ctx):
         f"✅ 已为 {target_name} (ID: {target_uid}) {action} {abs(delta):.2f} 学分\n"
         f"📚 当前余额：{new_balance:.2f} 学分"
     )
+
 async def admin_del_item(update, ctx):
     if update.effective_chat.type != 'private':
         return
@@ -771,4 +770,959 @@ async def cmd_create_lottery(update, ctx):
         prize_raw = ' '.join(parts[1:-1])
     else:
         prize_raw = "未命名奖品"
-    prize =
+    prize = prize_raw
+
+    if channel_id:
+        try:
+            chat = await ctx.bot.get_chat(channel_id)
+            try:
+                me = await ctx.bot.get_me()
+                member = await ctx.bot.get_chat_member(chat_id=channel_id, user_id=me.id)
+                if member.status not in ['administrator', 'creator']:
+                    await update.message.reply_text(
+                        f"⚠️ 机器人在频道 {channel_id} 中，但不是管理员，无法校验成员关注状态。\n"
+                        f"请将机器人设为管理员后再试。"
+                    )
+                    return
+            except Exception as e:
+                await update.message.reply_text(
+                    f"❌ 机器人不在频道 {channel_id} 中，或无法获取频道信息。\n"
+                    f"请先将机器人加入该频道并设为管理员，然后重新创建抽奖。\n"
+                    f"错误详情: {e}"
+                )
+                return
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ 无法访问频道 {channel_id}，请确认频道存在且机器人已加入。\n"
+                f"错误详情: {e}"
+            )
+            return
+
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO lotteries (title, prize, cost, draw_time, status, created_by, channel_id, need_msgs, msg_count) VALUES (?, ?, ?, ?, 0, ?, ?, ?, 0)",
+            (title, prize, cost, draw_time, update.effective_user.id, channel_id, need_msgs)
+        )
+        lid = c.lastrowid
+        conn.commit()
+
+    display_prize = prize.replace(',', '、').replace('，', '、')
+    msg = f"✅ 抽奖已创建！ID: {lid}\n标题：{title}\n奖品：{display_prize}\n消耗：{cost} 学分\n开奖时间：{draw_time.strftime('%Y-%m-%d %H:%M')}\n"
+    if channel_id:
+        msg += f"📢 参与条件：需关注频道 {channel_id}\n"
+    if need_msgs > 0:
+        msg += f"💬 需群内发言数 ≥ {need_msgs} 条（自创建起统计）\n"
+    msg += f"⏰ 当前服务器时间：{now_cn().strftime('%Y-%m-%d %H:%M')}"
+    await update.message.reply_text(msg)
+
+async def cmd_list_lotteries(update, ctx):
+    if update.effective_chat.type != 'private':
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, title, prize, cost, draw_time, status, winner_id, channel_id, need_msgs, msg_count, winners FROM lotteries ORDER BY id DESC")
+        rows = c.fetchall()
+    if not rows:
+        await update.message.reply_text("暂无抽奖记录。")
+        return
+    status_map = {0: "⏳ 未开始", 1: "🔚 已结束", 2: "🏆 已开奖"}
+    text = "📋 抽奖列表：\n"
+    for row in rows:
+        lid, title, prize, cost, dt, status, winner, channel, need_msgs, msg_count, winners = row
+        status_str = status_map.get(status, "未知")
+        display_prize = prize.replace(',', '、').replace('，', '、')
+        text += f"ID:{lid} | {title} | {display_prize} | 消耗{cost} | {dt} | {status_str}"
+        if channel:
+            text += f" | 频道:{channel}"
+        if need_msgs > 0:
+            text += f" | 需发言≥{need_msgs} (当前{msg_count})"
+        if winners:
+            winner_ids = [int(x) for x in winners.split(',') if x.strip().isdigit()]
+            names = []
+            for wid in winner_ids:
+                with db_connect() as conn2:
+                    c2 = conn2.cursor()
+                    c2.execute("SELECT nickname FROM users WHERE user_id=?", (wid,))
+                    w = c2.fetchone()
+                    names.append(w[0] if w else str(wid))
+            text += f" | 获奖者：{', '.join(names)}"
+        elif winner:
+            with db_connect() as conn2:
+                c2 = conn2.cursor()
+                c2.execute("SELECT nickname FROM users WHERE user_id=?", (winner,))
+                w = c2.fetchone()
+                winner_name = w[0] if w else str(winner)
+            text += f" | 获奖者：{winner_name}"
+        text += "\n"
+    await update.message.reply_text(text)
+
+# ========== /qx 取消抽奖 ==========
+async def cmd_cancel_lottery(update, ctx):
+    if update.effective_chat.type != 'private':
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    args = ctx.args
+    if len(args) != 1:
+        await update.message.reply_text("用法：/qx <抽奖ID>")
+        return
+    try:
+        lid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("抽奖ID必须是数字。")
+        return
+
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, title, status FROM lotteries WHERE id=?", (lid,))
+        row = c.fetchone()
+        if not row:
+            await update.message.reply_text("抽奖不存在。")
+            return
+        lid, title, status = row
+        if status != 0:
+            await update.message.reply_text("该抽奖已结束或已开奖，无法取消。")
+            return
+        c.execute("UPDATE lotteries SET status=1 WHERE id=?", (lid,))
+        conn.commit()
+    await update.message.reply_text(f"✅ 抽奖「{title}」（ID:{lid}）已取消，不产生获奖者。")
+
+# ========== /gg 修改开奖时间 ==========
+async def cmd_change_time(update, ctx):
+    if update.effective_chat.type != 'private':
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    text = update.message.text.strip()
+    if text.startswith('/gg'):
+        content = text[3:].strip()
+    else:
+        content = text
+
+    time_pattern = r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})'
+    match = re.search(time_pattern, content)
+    if not match:
+        await update.message.reply_text("未找到有效时间，请使用格式：YYYY-MM-DD HH:MM\n例如：/gg 5 2026-08-18 10:00")
+        return
+    new_time_str = match.group(1)
+
+    parts = content.split()
+    if not parts:
+        await update.message.reply_text("请提供抽奖ID。")
+        return
+    try:
+        lid = int(parts[0])
+    except ValueError:
+        await update.message.reply_text("抽奖ID必须是数字。")
+        return
+
+    try:
+        new_dt = datetime.strptime(new_time_str, "%Y-%m-%d %H:%M")
+        if new_dt <= now_cn():
+            await update.message.reply_text(f"新时间必须在未来。当前时间：{now_cn().strftime('%Y-%m-%d %H:%M')}")
+            return
+    except ValueError:
+        await update.message.reply_text("时间格式无效，请使用 YYYY-MM-DD HH:MM")
+        return
+
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, title, draw_time, status FROM lotteries WHERE id=?", (lid,))
+        row = c.fetchone()
+        if not row:
+            await update.message.reply_text("抽奖不存在。")
+            return
+        lid, title, old_time, status = row
+        if status != 0:
+            await update.message.reply_text("该抽奖已结束或已开奖，无法修改时间。")
+            return
+        c.execute("UPDATE lotteries SET draw_time=? WHERE id=?", (new_dt, lid))
+        conn.commit()
+    await update.message.reply_text(
+        f"✅ 抽奖「{title}」（ID:{lid}）的开奖时间已更新：\n"
+        f"旧时间：{old_time}\n新时间：{new_dt.strftime('%Y-%m-%d %H:%M')}"
+    )
+
+# ========== /QL 清理抽奖数据 ==========
+async def cmd_clean_lottery(update, ctx):
+    if update.effective_chat.type != 'private':
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    args = ctx.args
+    if len(args) != 1:
+        await update.message.reply_text("用法：/QL <抽奖ID>")
+        return
+    try:
+        lid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("抽奖ID必须是数字。")
+        return
+
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, title, status FROM lotteries WHERE id=?", (lid,))
+        row = c.fetchone()
+        if not row:
+            await update.message.reply_text("抽奖不存在。")
+            return
+        lid, title, status = row
+        c.execute("DELETE FROM lottery_participants WHERE lottery_id=?", (lid,))
+        c.execute("UPDATE lotteries SET status=0, winner_id=NULL, winners=NULL, msg_count=0 WHERE id=?", (lid,))
+        conn.commit()
+    await update.message.reply_text(f"✅ 抽奖「{title}」（ID:{lid}）已重置：参与者、获奖者、发言统计已清空，状态恢复为未开始。")
+
+# ========== /sb 取消用户参与（不退还学分） ==========
+async def cmd_remove_user_lottery(update, ctx):
+    if update.effective_chat.type != 'private':
+        return
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ 只有管理员可以使用此命令。")
+        return
+    args = ctx.args
+    if not args:
+        await update.message.reply_text("用法：/sb <用户ID> 或 /sb @用户名\n例如：/sb 123456789 或 /sb @someone")
+        return
+    user_identifier = args[0]
+    target_uid = None
+    if user_identifier.isdigit():
+        target_uid = int(user_identifier)
+    elif user_identifier.startswith('@'):
+        try:
+            chat = await ctx.bot.get_chat(user_identifier)
+            target_uid = chat.id
+        except Exception:
+            await update.message.reply_text("❌ 无法通过 @用户名 获取用户ID，请直接输入数字ID。")
+            return
+    else:
+        await update.message.reply_text("❌ 请输入有效的用户ID（数字）或 @用户名。")
+        return
+
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT l.id, l.title
+            FROM lottery_participants lp
+            JOIN lotteries l ON lp.lottery_id = l.id
+            WHERE lp.user_id = ? AND l.status = 0
+        """, (target_uid,))
+        rows = c.fetchall()
+        if not rows:
+            await update.message.reply_text(f"用户 {target_uid} 没有参与任何进行中的抽奖。")
+            return
+
+        titles = []
+        for lid, title in rows:
+            c.execute("DELETE FROM lottery_participants WHERE lottery_id=? AND user_id=?", (lid, target_uid))
+            titles.append(title)
+        conn.commit()
+
+    user_name = str(target_uid)
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT nickname FROM users WHERE user_id=?", (target_uid,))
+        row = c.fetchone()
+        if row:
+            user_name = row[0]
+
+    await update.message.reply_text(
+        f"✅ 已取消用户 {user_name}（ID:{target_uid}）在以下抽奖中的参与资格（不退还学分）：\n"
+        f"{', '.join(titles)}"
+    )
+
+# ========== 抽奖核心开奖函数 ==========
+async def do_draw(lottery_id, bot, force=False):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, title, prize, cost, status, draw_time, channel_id, need_msgs, msg_count FROM lotteries WHERE id=?", (lottery_id,))
+        row = c.fetchone()
+        if not row:
+            return False, "抽奖不存在"
+        lid, title, prize, cost, status, draw_time, channel, need_msgs, msg_count = row
+        if status != 0:
+            return False, "该抽奖已结束或已开奖"
+
+        if need_msgs > 0 and msg_count < need_msgs:
+            return False, f"发言数未达标 ({msg_count}/{need_msgs})，暂不开奖。"
+
+        c.execute("SELECT user_id FROM lottery_participants WHERE lottery_id=?", (lid,))
+        participants = [r[0] for r in c.fetchall()]
+        if not participants:
+            if force:
+                c.execute("UPDATE lotteries SET status=1 WHERE id=?", (lid,))
+                conn.commit()
+                return False, "该抽奖暂无参与者，已强制结束。"
+            else:
+                return False, "暂无参与者，未开奖，等待管理员处理。"
+
+        prize_list = [p.strip() for p in re.split(r'[,，]', prize) if p.strip()]
+        if not prize_list:
+            prize_list = ["未命名奖品"]
+
+        shuffled = participants.copy()
+        random.shuffle(shuffled)
+        winner_count = min(len(prize_list), len(shuffled))
+        winners = shuffled[:winner_count]
+
+        first_winner = winners[0] if winners else None
+        winners_str = ','.join(str(uid) for uid in winners) if winners else ''
+        c.execute("UPDATE lotteries SET status=2, winner_id=?, winners=? WHERE id=?", (first_winner, winners_str, lid))
+        conn.commit()
+
+        winner_links = []
+        for uid in winners:
+            c2 = conn.cursor()
+            c2.execute("SELECT nickname FROM users WHERE user_id=?", (uid,))
+            wrow = c2.fetchone()
+            name = wrow[0] if wrow else str(uid)
+            winner_links.append(f'<a href="tg://user?id={uid}">{name}</a>')
+
+        msg = f"🎉 抽奖开奖结果！\n标题：{title}\n\n"
+        for i, (prize_name, link) in enumerate(zip(prize_list[:winner_count], winner_links)):
+            msg += f"🏆 奖品：{prize_name} → 获奖者：{link}\n"
+        if len(prize_list) > winner_count:
+            msg += f"\n⚠️ 参与者数量不足，剩余 {len(prize_list)-winner_count} 个奖品无人获得。"
+        else:
+            msg += f"\n🎉 恭喜所有获奖者！"
+    for gid in ALLOWED_GROUPS:
+        try:
+            await bot.send_message(chat_id=gid, text=msg, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            print(f"发送开奖结果到 {gid} 失败: {e}")
+
+    # 向管理员发送中奖用户ID（抽奖保留此通知）
+    if winners:
+        admin_msg = f"🎉 抽奖「{title}」已开奖，中奖用户ID列表：\n"
+        for idx, uid in enumerate(winners):
+            prize_name = prize_list[idx] if idx < len(prize_list) else "未分配奖品"
+            admin_msg += f"奖品：{prize_name} → 用户ID：{uid}\n"
+        for aid in ADMIN_IDS:
+            try:
+                await bot.send_message(chat_id=aid, text=admin_msg)
+            except Exception as e:
+                print(f"发送中奖ID给管理员 {aid} 失败: {e}")
+
+    return True, f"抽奖 {lid} 已开奖，产生 {len(winners)} 位获奖者。"
+
+# ========== 骰子游戏核心 ==========
+DICE_INTERVAL = 180
+RAKE = 0.10
+
+def get_dice_state():
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT value FROM dice_state WHERE key='current_round'")
+        row = c.fetchone()
+        rid = int(row[0]) if row else 0
+        c.execute("SELECT value FROM dice_state WHERE key='end_time'")
+        row = c.fetchone()
+        end_time_str = row[0] if row else ''
+        status = 'active' if end_time_str and now_cn() < datetime.fromisoformat(end_time_str) else 'inactive'
+        return {'round_id': rid, 'end_time': end_time_str, 'status': status}
+
+def create_new_round():
+    with db_connect() as conn:
+        c = conn.cursor()
+        now = now_cn()
+        end_time = now + timedelta(seconds=DICE_INTERVAL)
+        c.execute("INSERT INTO dice_rounds (start_time, end_time, numbers, total, result, total_bets) VALUES (?, ?, ?, ?, ?, ?)",
+                  (now, end_time, None, None, None, 0))
+        rid = c.lastrowid
+        c.execute("REPLACE INTO dice_state (key, value) VALUES ('current_round', ?)", (str(rid),))
+        c.execute("REPLACE INTO dice_state (key, value) VALUES ('end_time', ?)", (end_time.isoformat(),))
+        conn.commit()
+        print(f"创建新轮: rid={rid}, end_time={end_time.isoformat()}")
+        return rid
+
+def close_round(rid, numbers, total, result, total_bets):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE dice_rounds SET numbers=?, total=?, result=?, total_bets=? WHERE id=?",
+                  (numbers, total, result, total_bets, rid))
+        conn.commit()
+
+def get_bets_for_round(rid):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT user_id, amount, bet_type, chat_id FROM dice_bets WHERE round_id=? AND win IS NULL", (rid,))
+        return c.fetchall()
+
+def update_bet_win(rid, uid, win_amount):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE dice_bets SET win=? WHERE round_id=? AND user_id=?", (win_amount, rid, uid))
+        conn.commit()
+
+def get_dice_win_rate(uid):
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM dice_bets WHERE user_id=? AND win IS NOT NULL", (uid,))
+        total = c.fetchone()[0]
+        if total == 0:
+            return 0, 0
+        c.execute("SELECT COUNT(*) FROM dice_bets WHERE user_id=? AND win > 0", (uid,))
+        wins = c.fetchone()[0]
+        return wins, total
+
+def generate_dice_numbers():
+    return [random.randint(0, 9) for _ in range(3)]
+
+async def round_timer(context, rid, chat_id):
+    print(f"定时器启动，等待 {DICE_INTERVAL} 秒后结算第{rid}期")
+    await asyncio.sleep(DICE_INTERVAL)
+    print(f"定时器触发，结算第{rid}期")
+    await settle_round(context, rid, chat_id)
+
+async def settle_round(context, rid, chat_id):
+    print(f">>> 结算第{rid}期")
+    bets = get_bets_for_round(rid)
+    if not bets:
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("UPDATE dice_rounds SET end_time=?, numbers='', total=0, result='无人下注', total_bets=0 WHERE id=?", (now_cn(), rid))
+            conn.commit()
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=f"🎲 同学会骰王 第{rid}期 无人下注，已结束。")
+        except Exception as e:
+            print(f"发送无人下注通知失败: {e}")
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM dice_bets WHERE round_id = ?", (rid,))
+            c.execute("DELETE FROM dice_rounds WHERE id = ?", (rid,))
+            conn.commit()
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("REPLACE INTO dice_state (key, value) VALUES ('current_round', '0')")
+            c.execute("REPLACE INTO dice_state (key, value) VALUES ('end_time', '')")
+            conn.commit()
+        return
+    numbers = generate_dice_numbers()
+    total = sum(numbers)
+    is_big = total >= 14
+    is_odd = total % 2 == 1
+    result_type = []
+    if is_big:
+        result_type.append('大')
+    else:
+        result_type.append('小')
+    if is_odd:
+        result_type.append('单')
+    else:
+        result_type.append('双')
+    result_combined = ''.join(result_type)
+    winners = []
+    for uid, amount, bet_type, _ in bets:
+        win = 0
+        if bet_type in ['大', '小', '单', '双']:
+            if bet_type in result_type:
+                win = amount
+        elif bet_type in ['大单', '大双', '小单', '小双']:
+            if bet_type == result_combined:
+                win = amount * 3
+        if win > 0:
+            win_after_rake = win * (1 - RAKE)
+            add_coins(uid, amount + win_after_rake, f"骰子中奖 {bet_type}")
+            winners.append((uid, amount, bet_type, win_after_rake))
+            update_bet_win(rid, uid, win_after_rake)
+        else:
+            update_bet_win(rid, uid, 0.0)
+    close_round(rid, '-'.join(map(str, numbers)), total, result_combined, len(bets))
+    date_str = now_cn().strftime('%m月%d日')
+    result_msg = f"<b>🎲 同学会骰王  {date_str} 第{rid}期 开奖结果</b>\n"
+    result_msg += f"🎯号码：{' + '.join(map(str, numbers))} = {total}\n"
+    result_msg += f"📋结果：<b>{result_combined}</b>\n\n"
+    if winners:
+        result_msg += "🏆 中奖名单：\n"
+        for uid, amount, bet_type, win in winners:
+            with db_connect() as conn:
+                c = conn.cursor()
+                c.execute("SELECT nickname FROM users WHERE user_id=?", (uid,))
+                row = c.fetchone()
+                name = row[0] if row else str(uid)
+            link = f'<a href="tg://user?id={uid}">{name}</a>'
+            result_msg += f"  {link} 押{bet_type}{amount}学分 → +{win:.2f}学分\n"
+    else:
+        result_msg += "😭本期无人中奖\n"
+    result_msg += "\n⏰下一期即将开始，请下注"
+
+    # ===== 收集所有下注过的群组（去重） =====
+    chat_ids = set()
+    for _, _, _, cid in bets:
+        if cid and cid in ALLOWED_GROUPS:
+            chat_ids.add(cid)
+    if not chat_ids:
+        chat_ids.add(chat_id)
+    for gid in chat_ids:
+        try:
+            await context.bot.send_message(chat_id=gid, text=result_msg, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            print(f"发送开奖结果到 {gid} 失败: {e}")
+
+    # 注意：骰子中奖不再向管理员发送ID列表
+
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM dice_bets WHERE round_id = ?", (rid,))
+        c.execute("DELETE FROM dice_rounds WHERE id = ?", (rid,))
+        conn.commit()
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("REPLACE INTO dice_state (key, value) VALUES ('current_round', '0')")
+        c.execute("REPLACE INTO dice_state (key, value) VALUES ('end_time', '')")
+        conn.commit()
+
+async def dice_stats(update, ctx):
+    if update.message.from_user.is_bot:
+        return
+    uid = update.effective_user.id
+    wins, total = get_dice_win_rate(uid)
+    if total == 0:
+        await update.message.reply_text("您还没有参与过骰子游戏记录。")
+    else:
+        rate = wins / total * 100
+        await update.message.reply_text(f"🎲 您的骰子战绩：\n胜场：{wins}\n总局数：{total}\n胜率：{rate:.1f}%")
+
+# ========== 骰子容错：检查卡住的轮次 ==========
+async def check_and_settle_stuck_rounds(bot):
+    """检查数据库中是否有卡住的骰子轮次（定时器丢失导致未结算），若有则强制结算"""
+    now = now_cn()
+    with db_connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, end_time FROM dice_rounds WHERE result IS NULL")
+        rows = c.fetchall()
+    for rid, end_time_str in rows:
+        try:
+            end_time = datetime.fromisoformat(end_time_str) if isinstance(end_time_str, str) else end_time_str
+        except:
+            continue
+        if end_time <= now:
+            with db_connect() as conn:
+                c = conn.cursor()
+                c.execute("SELECT DISTINCT user_id FROM dice_bets WHERE round_id=?", (rid,))
+                has_bets = c.fetchone() is not None
+            if has_bets:
+                with db_connect() as conn:
+                    c = conn.cursor()
+                    c.execute("SELECT DISTINCT chat_id FROM dice_bets WHERE round_id=? AND chat_id != 0", (rid,))
+                    chat_ids = [r[0] for r in c.fetchall()]
+                if not chat_ids:
+                    chat_ids = [ALLOWED_GROUPS[0]] if ALLOWED_GROUPS else []
+                if chat_ids:
+                    try:
+                        print(f"发现卡住的轮次 {rid}，强制结算...")
+                        wrapper = types.SimpleNamespace(bot=bot)
+                        await settle_round(wrapper, rid, chat_ids[0])
+                    except Exception as e:
+                        print(f"强制结算轮次 {rid} 失败: {e}")
+            else:
+                with db_connect() as conn:
+                    c = conn.cursor()
+                    c.execute("DELETE FROM dice_rounds WHERE id=?", (rid,))
+                    c.execute("REPLACE INTO dice_state (key, value) VALUES ('current_round', '0')")
+                    c.execute("REPLACE INTO dice_state (key, value) VALUES ('end_time', '')")
+                    conn.commit()
+                print(f"清理空的轮次 {rid}")
+
+# ========== 后台自动开奖任务 ==========
+async def auto_draw_loop(bot):
+    while True:
+        try:
+            now = now_cn()
+            with db_connect() as conn:
+                c = conn.cursor()
+                c.execute("SELECT id, draw_time FROM lotteries WHERE status=0")
+                rows = c.fetchall()
+            for lid, draw_time_str in rows:
+                try:
+                    draw_time = datetime.fromisoformat(draw_time_str)
+                except:
+                    continue
+                if draw_time <= now:
+                    success, msg = await do_draw(lid, bot, force=False)
+                    if success:
+                        print(f"自动开奖 {lid}: {msg}")
+                    else:
+                        print(f"自动开奖 {lid}: {msg}")
+            await check_and_settle_stuck_rounds(bot)
+        except Exception as e:
+            print(f"自动开奖循环出错: {e}")
+        await asyncio.sleep(60)
+
+# ========== 普通命令 ==========
+async def cmd_start(update, ctx):
+    if update.message.from_user.is_bot:
+        return
+    if update.effective_chat.type == 'private':
+        uid = update.effective_user.id
+        if uid in ADMIN_IDS:
+            help_text = (
+                "🤖 管理员指令：\n"
+                "/additem <名称> <价格> <限量> - 添加商品（限量0为无限）\n"
+                "/listitems - 查看商品列表\n"
+                "/delitem <商品ID> - 删除商品\n"
+                "群聊：/学分 +数字 或 /学分 -数字（需回复用户消息）\n"
+                "私聊：/xf 金额（给自己加） 或 /xf @用户名 金额  或 /xf 用户ID 金额（可带正负号）\n"
+                "/coins - 查询自己学分\n"
+                "/shop - 打开商城\n"
+                "/start - 显示本帮助\n"
+                "\n🎰 抽奖管理（私聊）：\n"
+                "/cj <标题> <奖品1,奖品2,...> <消耗学分> <开奖时间> [-c @channel] [-f 发言数] - 创建抽奖\n"
+                "/cjlist - 查看所有抽奖\n"
+                "/qx <抽奖ID> - 取消抽奖\n"
+                "/gg <抽奖ID> <新时间> - 修改开奖时间\n"
+                "/QL <抽奖ID> - 重置抽奖（清空参与者和获奖者）\n"
+                "/sb <用户ID/@用户名> - 取消某人在所有进行中抽奖的参与资格（不退还学分）\n"
+            )
+            await update.message.reply_text(help_text)
+        else:
+            return
+        return
+    if update.effective_chat.type in ('group', 'supergroup'):
+        if update.effective_chat.id not in ALLOWED_GROUPS:
+            return
+    uid = update.effective_user.id
+    name = update.effective_user.first_name
+    get_user(uid, name)
+    bal = get_coins(uid)
+    link = f'<a href="tg://user?id={uid}">{name}</a>'
+    text = f"我的学分\n用户：{link}\n学分：{bal:.2f}"
+    await update.message.reply_text(text, reply_markup=wallet_kb(), parse_mode=ParseMode.HTML)
+
+async def cmd_coins(update, ctx):
+    if update.message.from_user.is_bot:
+        return
+    if update.effective_chat.type in ('group', 'supergroup'):
+        if update.effective_chat.id not in ALLOWED_GROUPS:
+            return
+    uid = update.effective_user.id
+    name = update.effective_user.first_name
+    bal = get_coins(uid)
+    link = f'<a href="tg://user?id={uid}">{name}</a>'
+    await update.message.reply_text(f"💰 {link}，你有 {bal:.2f} 学分。", parse_mode=ParseMode.HTML)
+
+async def cmd_shop(update, ctx):
+    if update.message.from_user.is_bot:
+        return
+    if update.effective_chat.type in ('group', 'supergroup'):
+        if update.effective_chat.id not in ALLOWED_GROUPS:
+            return
+    uid = update.effective_user.id
+    name = update.effective_user.first_name
+    get_user(uid, name)
+    bal = get_coins(uid)
+    await update.message.reply_text(
+        f"🛒 学分商城\n💎 当前余额：{bal:.2f} 学分\n点击下方按钮兑换商品：",
+        reply_markup=shop_kb()
+    )
+
+# ========== 消息处理器 ==========
+async def on_msg(update, ctx):
+    if update.message.from_user.is_bot:
+        return
+    if not update.message or not update.message.text:
+        return
+    if update.effective_chat.type in ('group', 'supergroup'):
+        if update.effective_chat.id not in ALLOWED_GROUPS:
+            return
+    text = update.message.text.strip()
+    if text == "商城":
+        uid = update.message.from_user.id
+        name = update.message.from_user.first_name
+        get_user(uid, name)
+        bal = get_coins(uid)
+        await update.message.reply_text(
+            f"🛒 学分商城\n💎 当前余额：{bal:.2f} 学分\n点击下方按钮兑换商品：",
+            reply_markup=shop_kb()
+        )
+        return
+    if text == "学分":
+        uid = update.message.from_user.id
+        name = update.message.from_user.first_name
+        bal = get_coins(uid)
+        link = f'<a href="tg://user?id={uid}">{name}</a>'
+        await update.message.reply_text(f"💰 {link}，你的当前余额是 {bal:.2f} 学分。", parse_mode=ParseMode.HTML)
+        return
+    if text == "排行榜":
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT user_id, nickname, coins FROM users ORDER BY coins DESC LIMIT 50")
+            rows = c.fetchall()
+        if not rows:
+            await update.message.reply_text("暂无用户数据。")
+            return
+        msg = "🏆 学分排行榜 (前50)\n"
+        for idx, (uid, nick, coins) in enumerate(rows, 1):
+            name = nick if nick else f"用户{uid}"
+            msg += f"{idx}. {name}: {coins:.2f}学分\n"
+        await update.message.reply_text(msg)
+        return
+
+    if text == "开奖":
+        now = now_cn()
+        two_days_ago = now - timedelta(days=2)
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT id, title, prize, draw_time, winners
+                FROM lotteries
+                WHERE status = 2 AND draw_time >= ?
+                ORDER BY draw_time DESC
+                LIMIT 20
+            """, (two_days_ago,))
+            rows = c.fetchall()
+        if not rows:
+            await update.message.reply_text("📭 近2天内暂无开奖记录。")
+            return
+        msg = "📋 近2天开奖记录：\n\n"
+        for idx, (lid, title, prize, draw_time, winners_str) in enumerate(rows, 1):
+            prize_list = [p.strip() for p in re.split(r'[,，]', prize) if p.strip()]
+            if not prize_list:
+                prize_list = ["未命名奖品"]
+            winner_ids = []
+            if winners_str:
+                winner_ids = [int(x) for x in winners_str.split(',') if x.strip().isdigit()]
+            items = []
+            for i, p in enumerate(prize_list):
+                if i < len(winner_ids):
+                    wid = winner_ids[i]
+                    with db_connect() as conn2:
+                        c2 = conn2.cursor()
+                        c2.execute("SELECT nickname FROM users WHERE user_id=?", (wid,))
+                        wrow = c2.fetchone()
+                        name = wrow[0] if wrow else str(wid)
+                    winner_link = f'<a href="tg://user?id={wid}">{name}</a>'
+                    items.append(f"{p} → {winner_link}")
+                else:
+                    items.append(f"{p} → ❌ 无人获得")
+            msg += f"{idx}. 🎯 标题：{title}\n"
+            msg += f"   🕒 开奖时间：{draw_time}\n"
+            for item in items:
+                msg += f"   🎁 {item}\n"
+            msg += "\n"
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        return
+
+    if text == "低保":
+        uid = update.message.from_user.id
+        name = update.message.from_user.first_name
+        get_user(uid, name)
+        bal = get_coins(uid)
+        if bal >= 5:
+            await update.message.reply_text("您的学分已达到或超过 5 分，无需领取低保。")
+            return
+        today_count = get_welfare_today_count(uid)
+        if today_count >= 5:
+            await update.message.reply_text("您今天已领取 5 次低保，已达上限，请明天再试。")
+            return
+        add_coins(uid, 5, "每日低保领取")
+        add_welfare_record(uid)
+        new_bal = get_coins(uid)
+        remaining = 5 - (today_count + 1)
+        await update.message.reply_text(
+            f"✅ 低保发放成功！\n"
+            f"您当前余额：{new_bal:.2f} 学分\n"
+            f"今日剩余领取次数：{remaining} 次"
+        )
+        return
+
+    if text == "抽奖":
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT id, title, prize, cost, draw_time, channel_id, need_msgs, msg_count FROM lotteries WHERE status=0 ORDER BY draw_time ASC")
+            rows = c.fetchall()
+        if not rows:
+            await update.message.reply_text("当前没有任何抽奖活动，请关注后续通知。")
+            return
+        for lid, title, prize, cost, draw_time, channel_id, need_msgs, msg_count in rows:
+            if isinstance(draw_time, str):
+                draw_time = datetime.fromisoformat(draw_time)
+            expired = now_cn() > draw_time
+            with db_connect() as conn2:
+                c2 = conn2.cursor()
+                c2.execute("SELECT 1 FROM lottery_participants WHERE lottery_id=? AND user_id=?", (lid, update.effective_user.id))
+                already = c2.fetchone() is not None
+                c2.execute("SELECT user_id FROM lottery_participants WHERE lottery_id=?", (lid,))
+                participants = [p[0] for p in c2.fetchall()]
+                names = []
+                for pid in participants:
+                    c3 = conn2.cursor()
+                    c3.execute("SELECT nickname FROM users WHERE user_id=?", (pid,))
+                    nick = c3.fetchone()
+                    names.append(nick[0] if nick else str(pid))
+            btn = Btn("🎟️ 参与抽奖", callback_data=f"lottery_join_{lid}") if not expired else None
+            kb = Markup([[btn]]) if btn else None
+            display_prize = prize.replace(',', '、').replace('，', '、')
+            msg = f"🎰 当前抽奖活动\n标题：{title}\n奖品：{display_prize}\n消耗：{cost} 学分\n开奖时间：{draw_time}\n"
+            if channel_id:
+                msg += f"📢 参与条件：需关注频道 {channel_id}\n"
+            if need_msgs > 0:
+                msg += f"💬 需群内发言数 ≥ {need_msgs} 条（当前 {msg_count} 条）\n"
+            if names:
+                msg += f"👥 已参与（{len(names)}人）：{', '.join(names)}\n"
+            else:
+                msg += "👥 暂无人参与\n"
+            if expired:
+                msg += "⏰ 该抽奖已过开奖时间，无法参与。"
+            else:
+                msg += "点击下方按钮参与！"
+            await update.message.reply_text(msg, reply_markup=kb)
+        return
+
+    if text.startswith('/'):
+        return
+
+    # 发言统计
+    with db_connect() as conn:
+        c = conn.cursor()
+        now = now_cn()
+        c.execute("SELECT id, created_at FROM lotteries WHERE status=0 AND need_msgs > 0")
+        rows = c.fetchall()
+    for lid, created_at in rows:
+        try:
+            created_dt = datetime.fromisoformat(created_at) if isinstance(created_at, str) else created_at
+        except:
+            continue
+        if now >= created_dt:
+            with db_connect() as conn2:
+                c2 = conn2.cursor()
+                c2.execute("UPDATE lotteries SET msg_count = msg_count + 1 WHERE id=? AND status=0", (lid,))
+                conn2.commit()
+
+    # 骰子下注
+    dice_match = re.match(r'^押\s+(\S+)\s+(\d+(?:\.\d+)?)$', text) or re.match(r'^押\s+(\d+(?:\.\d+)?)\s+(\S+)$', text)
+    if dice_match:
+        if dice_match.group(1).replace('.', '').isdigit():
+            amount = float(dice_match.group(1))
+            bet_type = dice_match.group(2)
+        else:
+            bet_type = dice_match.group(1)
+            amount = float(dice_match.group(2))
+        valid_bets = ['大', '小', '单', '双', '大单', '大双', '小单', '小双']
+        if bet_type not in valid_bets:
+            await update.message.reply_text("玩法错误，请选择：大、小、单、双、大单、大双、小单、小双")
+            return
+        if amount <= 0:
+            await update.message.reply_text("下注金额必须为正数。")
+            return
+
+        state = get_dice_state()
+        if state['status'] != 'active':
+            rid = create_new_round()
+            chat_id = update.effective_chat.id
+            asyncio.create_task(round_timer(ctx, rid, chat_id))
+            state = get_dice_state()
+            if state['status'] != 'active':
+                await update.message.reply_text("游戏初始化失败，请稍后再试。")
+                return
+
+        round_id = state['round_id']
+        uid = update.message.from_user.id
+        name = update.message.from_user.first_name
+
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM dice_bets WHERE round_id=? AND user_id=?", (round_id, uid))
+            bet_count = c.fetchone()[0]
+        if bet_count >= 5:
+            await update.message.reply_text("您在本期骰子中已下注 5 次，达到上限，不能继续下注。")
+            return
+
+        get_user(uid, name)
+        bal = get_coins(uid)
+        if bal < amount:
+            await update.message.reply_text(f"余额不足！你需要 {amount} 学分，当前余额 {bal:.2f}。")
+            return
+        if not sub_coins(uid, amount, f"骰子下注 {bet_type}"):
+            await update.message.reply_text("下注失败，请稍后再试。")
+            return
+
+        chat_id = update.effective_chat.id
+        with db_connect() as conn:
+            c = conn.cursor()
+            c.execute("INSERT INTO dice_bets (round_id, user_id, amount, bet_type, win, chat_id) VALUES (?,?,?,?,?,?)",
+                      (round_id, uid, amount, bet_type, None, chat_id))
+            conn.commit()
+
+        end_time = datetime.fromisoformat(state['end_time'])
+        remaining_seconds = max(0, int((end_time - now_cn()).total_seconds()))
+        date_str = now_cn().strftime('%m月%d日')
+        rid = round_id
+        bet_example = "押 大 10  押 小 10  押大双 10"
+        status = "🟢投注中"
+        msg = f"🎲同学会骰王 {date_str} 第{rid}期\n"
+        msg += f"💡状态：    {status}\n"
+        msg += f"⏰️距离开奖:{remaining_seconds}秒\n"
+        msg += f"💰投注格式：{bet_example}"
+        await update.message.reply_text(msg)
+        return
+
+    if len(text) < 4:
+        return
+    uid = update.message.from_user.id
+    name = update.message.from_user.first_name
+    get_user(uid, name)
+    today_gain = get_today_gain(uid)
+    base_prob = get_dynamic_drop_prob(today_gain)
+    use_bonus = check_and_use_first_bonus(uid)
+    current_prob = base_prob * TRIPLE_MULTIPLIER if use_bonus else base_prob
+    current_prob = min(current_prob, 1.0)
+    if random.random() < current_prob:
+        coin = rand_coin()
+        add_coins(uid, coin, "发言掉落")
+        add_today_gain(uid, coin)
+        bal = get_coins(uid)
+        link = f'<a href="tg://user?id={uid}">{name}</a>'
+        await update.message.reply_text(
+            f"🧧恭喜 {link} 中奖！\n💰获得：{coin:.2f} 学分\n📚余额：{bal:.2f} 学分\n💡发送「商城」可兑换商品",
+            parse_mode=ParseMode.HTML
+        )
+
+# ========== 启动 ==========
+async def post_init(app):
+    # 启动后台自动开奖/骰子结算任务
+    app.bot_data['auto_draw_task'] = asyncio.create_task(auto_draw_loop(app.bot))
+
+async def post_shutdown(app):
+    task = app.bot_data.get('auto_draw_task')
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+def main():
+    init_db()
+    app = Application.builder().token(TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
+
+    app.add_handler(MessageHandler(filters.Regex(r'^/学分'), admin_credit_handler))
+    app.add_handler(CommandHandler("xf", admin_credit_private, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("coins", cmd_coins))
+    app.add_handler(CommandHandler("shop", cmd_shop))
+    app.add_handler(MessageHandler(filters.Regex(r'^骰子战绩$'), dice_stats))
+    app.add_handler(CommandHandler("dice_stats", dice_stats))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_msg))
+    app.add_handler(CallbackQueryHandler(cb))
+    app.add_handler(CommandHandler("test", test_callback))
+    app.add_handler(CallbackQueryHandler(test_cb, pattern="^test$"))
+    app.add_handler(CommandHandler("additem", admin_add_item))
+    app.add_handler(CommandHandler("listitems", admin_list_items))
+    app.add_handler(CommandHandler("delitem", admin_del_item))
+    app.add_handler(CommandHandler("cj", cmd_create_lottery))
+    app.add_handler(CommandHandler("cjlist", cmd_list_lotteries))
+    app.add_handler(CommandHandler("qx", cmd_cancel_lottery))
+    app.add_handler(CommandHandler("gg", cmd_change_time))
+    app.add_handler(CommandHandler("ql", cmd_clean_lottery))
+    app.add_handler(CommandHandler("sb", cmd_remove_user_lottery))
+    app.run_polling(allowed_updates=["message", "callback_query"])
+
+if __name__ == "__main__":
+    main()
